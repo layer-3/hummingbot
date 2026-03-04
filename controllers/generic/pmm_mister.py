@@ -20,7 +20,7 @@ class PMMisterConfig(ControllerConfigBase):
     controller_type: str = "generic"
     controller_name: str = "pmm_mister"
     connector_name: str = Field(default="binance")
-    trading_pair: str = Field(default="BTC-FDUSD")
+    trading_pair: str = Field(default="BTC-USDT")
     portfolio_allocation: Decimal = Field(default=Decimal("0.1"), json_schema_extra={"is_updatable": True})
     target_base_pct: Decimal = Field(default=Decimal("0.5"), json_schema_extra={"is_updatable": True})
     min_base_pct: Decimal = Field(default=Decimal("0.3"), json_schema_extra={"is_updatable": True})
