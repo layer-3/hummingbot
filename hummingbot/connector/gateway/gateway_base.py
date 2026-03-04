@@ -17,7 +17,7 @@ from hummingbot.core.data_type.cancellation_result import CancellationResult
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState, OrderUpdate, TradeFeeBase, TradeUpdate
 from hummingbot.core.data_type.limit_order import LimitOrder
-from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount, TradeFeeSchema
 from hummingbot.core.event.events import MarketEvent, MarketTransactionFailureEvent
 from hummingbot.core.gateway.gateway_http_client import GatewayHttpClient
 from hummingbot.core.network_iterator import NetworkStatus
@@ -503,6 +503,26 @@ class GatewayBase(ConnectorBase):
         Gateway connectors don't have trading rules in the same way as exchange connectors.
         """
         pass
+
+    async def _update_order_status(self):
+        """
+        No-op for gateway connectors.
+        Gateway connectors track positions via the executor layer, not traditional order polling.
+        """
+        pass
+
+    def trade_fee_schema(self):
+        """
+        Return default fee schema for gateway connectors.
+
+        Gateway connectors don't need AllConnectorSettings lookup since:
+        - All gateway fees are flat transaction fees (SOL, ETH, etc.)
+        - The actual fee is captured from Gateway response (tx_fee) and passed as flat_fees
+        - Percent fee fields remain at defaults (0)
+        """
+        if self._trade_fee_schema is None:
+            self._trade_fee_schema = TradeFeeSchema()
+        return self._trade_fee_schema
 
     async def cancel_all(self, timeout_seconds: float) -> List[CancellationResult]:
         """
