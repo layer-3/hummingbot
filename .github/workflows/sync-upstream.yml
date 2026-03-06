@@ -1,0 +1,47 @@
+name: Sync Upstream Hummingbot
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Every Monday at 6am UTC
+  workflow_dispatch:      # Allow manual trigger
+
+jobs:
+  sync:
+    name: Sync master with upstream
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/hummingbot/hummingbot.git
+
+      - name: Fetch upstream
+        run: git fetch upstream master
+
+      - name: Check for new commits
+        id: check
+        run: |
+          BEHIND=$(git rev-list HEAD..upstream/master --count)
+          echo "behind=$BEHIND" >> $GITHUB_OUTPUT
+          echo "Upstream is $BEHIND commits ahead"
+
+      - name: Merge upstream
+        if: steps.check.outputs.behind != '0'
+        run: |
+          git merge upstream/master --no-edit
+          git push origin master
+          echo "Merged ${{ steps.check.outputs.behind }} commits from upstream"
+
+      - name: Already up to date
+        if: steps.check.outputs.behind == '0'
+        run: echo "Already up to date with upstream"
