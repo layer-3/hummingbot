@@ -6,9 +6,13 @@
 [![Based on Hummingbot](https://img.shields.io/badge/based%20on-hummingbot%2Fhummingbot-blue)](https://github.com/hummingbot/hummingbot)
 [![Yellow Pro Connector](https://img.shields.io/badge/connector-yellow__pro-yellow)](https://yellow.pro)
 
-> **This is a fork of [hummingbot/hummingbot](https://github.com/hummingbot/hummingbot) with the addition of the Yellow Pro (`yellow_pro`) spot exchange connector.**
->
-> The `master` branch tracks upstream Hummingbot. All Yellow Pro additions live on the [`yellow-pro`](../../tree/yellow-pro) branch.
+<div align="center">
+
+### This is a fork of [hummingbot/hummingbot](https://github.com/hummingbot/hummingbot) with the addition of the Yellow Pro (`yellow_pro`) spot exchange connector.
+
+**The `master` branch tracks upstream Hummingbot. All Yellow Pro additions live on the [`yellow-pro`](../../tree/yellow-pro) branch.**
+
+</div>
 
 ---
 
