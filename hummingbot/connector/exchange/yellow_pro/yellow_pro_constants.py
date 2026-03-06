@@ -11,19 +11,19 @@ PRODUCTION_DOMAIN = "production"
 DOMAIN = PRODUCTION_DOMAIN
 
 REST_URLS = {
-    PRODUCTION_DOMAIN: "https://yellow-neodax-client-production.openware-account.workers.dev",
+    PRODUCTION_DOMAIN: "https://api.staging.yellow.pro.neodax.app",
 }
 
 AUTH_URLS = {
-    PRODUCTION_DOMAIN: "https://yellow-neodax-client-production.openware-account.workers.dev",
+    PRODUCTION_DOMAIN: "https://api.staging.yellow.pro.neodax.app",
 }
 
 QUOTE_URLS = {
-    PRODUCTION_DOMAIN: "https://yellow-neodax-client-production.openware-account.workers.dev",
+    PRODUCTION_DOMAIN: "https://api.staging.yellow.pro.neodax.app",
 }
 
 WS_URLS = {
-    PRODUCTION_DOMAIN: "wss://yellow-neodax-client-production.openware-account.workers.dev/ws",
+    PRODUCTION_DOMAIN: "wss://api.staging.yellow.pro.neodax.app/api/v1/ranger/public/",
 }
 
 BROKER_ID = "HBOT"
