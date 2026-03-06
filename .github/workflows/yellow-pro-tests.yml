@@ -69,7 +69,8 @@ jobs:
             -v \
             --tb=short \
             --no-header \
-            -p no:cacheprovider
+            -p no:cacheprovider \
+            -m "not livetest"
 
       - name: Report coverage for Yellow Pro connector
         shell: bash
@@ -80,6 +81,7 @@ jobs:
             --cov=hummingbot/connector/exchange/yellow_pro \
             --cov-report=term-missing \
             --cov-report=xml:yellow_pro_coverage.xml \
+            -m "not livetest" \
             -q
 
       - name: Upload coverage report
