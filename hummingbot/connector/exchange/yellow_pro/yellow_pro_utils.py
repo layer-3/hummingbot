@@ -9,7 +9,7 @@ DEFAULT_FEES = TradeFeeSchema(
     taker_percent_fee_decimal=Decimal("0.001"),
 )
 
-CENTRALIZED = False
+CENTRALIZED = True
 EXAMPLE_PAIR = "BTC-YTEST.USD"
 
 
