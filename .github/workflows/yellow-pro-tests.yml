@@ -1,0 +1,93 @@
+name: Yellow Pro Connector Tests
+
+on:
+  push:
+    branches: [yellow-pro]
+    paths:
+      - 'hummingbot/connector/exchange/yellow_pro/**'
+      - 'test/hummingbot/connector/exchange/yellow_pro/**'
+  pull_request:
+    branches: [yellow-pro]
+    paths:
+      - 'hummingbot/connector/exchange/yellow_pro/**'
+      - 'test/hummingbot/connector/exchange/yellow_pro/**'
+    types: [ready_for_review, opened, synchronize, reopened]
+  workflow_dispatch:
+
+jobs:
+  test_yellow_pro:
+    name: Yellow Pro unit tests
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache conda dependencies
+        id: conda-dependencies
+        uses: actions/cache@v4
+        env:
+          CONDA_CACHE_NUMBER: 0
+        with:
+          path: |
+            /home/runner/conda_pkgs_dir/
+            /usr/share/miniconda/envs
+          key: ${{ runner.os }}-conda-${{ env.CONDA_CACHE_NUMBER }}-${{ hashFiles('setup/environment.yml') }}
+
+      - name: Cache compiled Hummingbot
+        id: program-changes
+        uses: actions/cache@v4
+        env:
+          CACHE_NUMBER: 0
+        with:
+          path: README.md
+          key: ${{ runner.os }}-build-${{ env.CACHE_NUMBER }}-${{ hashFiles('hummingbot/*', '**/*.py', '**/*.py*', '**/*.pxd') }}
+
+      - name: Install Hummingbot environment
+        if: steps.conda-dependencies.outputs.cache-hit != 'true'
+        shell: bash -l {0}
+        run: ./install
+
+      - name: Compile Hummingbot
+        if: steps.program-changes.outputs.cache-hit != 'true' || steps.conda-dependencies.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          WITHOUT_CYTHON_OPTIMIZATIONS: 'true'
+        run: |
+          source $CONDA/etc/profile.d/conda.sh
+          conda activate hummingbot
+          ./compile
+
+      - name: Run Yellow Pro connector tests
+        shell: bash
+        run: |
+          source $CONDA/etc/profile.d/conda.sh
+          conda activate hummingbot
+          pytest test/hummingbot/connector/exchange/yellow_pro/ \
+            -v \
+            --tb=short \
+            --no-header \
+            -p no:cacheprovider \
+            -m "not livetest"
+
+      - name: Report coverage for Yellow Pro connector
+        shell: bash
+        run: |
+          source $CONDA/etc/profile.d/conda.sh
+          conda activate hummingbot
+          pytest test/hummingbot/connector/exchange/yellow_pro/ \
+            --cov=hummingbot/connector/exchange/yellow_pro \
+            --cov-report=term-missing \
+            --cov-report=xml:yellow_pro_coverage.xml \
+            -m "not livetest" \
+            -q
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: yellow-pro-coverage
+          path: yellow_pro_coverage.xml
+          retention-days: 7
