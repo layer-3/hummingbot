@@ -1,7 +1,10 @@
 from decimal import Decimal
+from typing import Optional
+
 from pydantic import ConfigDict, Field, SecretStr
 
 from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
+from hummingbot.connector.exchange.yellow_pro import yellow_pro_constants as CONSTANTS
 from hummingbot.core.data_type.trade_fee import TradeFeeSchema
 
 DEFAULT_FEES = TradeFeeSchema(
@@ -42,6 +45,15 @@ class YellowProConfigMap(BaseConnectorConfigMap):
         default=...,
         json_schema_extra={
             "prompt": "Enter your YellowPro spot account session id",
+            "is_secure": False,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        },
+    )
+    yellow_pro_domain: Optional[str] = Field(
+        default=CONSTANTS.DOMAIN,
+        json_schema_extra={
+            "prompt": f"Enter YellowPro domain ({CONSTANTS.PRODUCTION_DOMAIN}/{CONSTANTS.STAGING_DOMAIN})",
             "is_secure": False,
             "is_connect_key": True,
             "prompt_on_new": True,

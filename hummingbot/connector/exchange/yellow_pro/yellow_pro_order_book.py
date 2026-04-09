@@ -54,7 +54,7 @@ class YellowProOrderBook(OrderBook):
             msg.update(metadata)
         bids = _parse_float_book(msg.get("bids", []))
         asks = _parse_float_book(msg.get("asks", []))
-        update_id = int(msg.get("sequence_num"))
+        update_id = int(msg.get("sequence_num") or int((timestamp or time.time()) * 1e3))
         ts = timestamp or _parse_iso_timestamp(msg.get("created_at") or msg.get("timestamp"))
         return OrderBookMessage(
             OrderBookMessageType.DIFF,
@@ -74,12 +74,12 @@ class YellowProOrderBook(OrderBook):
             metadata: Optional[Dict[str, Any]] = None) -> OrderBookMessage:
         if metadata:
             msg.update(metadata)
-        side = msg.get("side", "").lower()
+        side = (msg.get("side") or "").lower()
         trade_type = TradeType.BUY if side in ("buy", "bid", "b") else TradeType.SELL
         trade_id = str(msg.get("id") or msg.get("trade_id") or msg.get("uuid") or "")
         timestamp = msg.get("executed_at") or msg.get("timestamp") or msg.get("created_at")
-        price = float(msg.get("price"))
-        amount = float(msg.get("amount"))
+        price = float(msg.get("price") or 0)
+        amount = float(msg.get("amount") or 0)
         return OrderBookMessage(
             OrderBookMessageType.TRADE,
             {

@@ -112,8 +112,13 @@ class CreateCommand:
     async def prompt_for_configuration_v2(self,  # type: HummingbotApplication
                                           script_to_config: str):
         try:
-            module = sys.modules.get(f"{settings.SCRIPT_STRATEGIES_MODULE}.{script_to_config}")
-            script_module = importlib.reload(module)
+            module_path = f"{settings.SCRIPT_STRATEGIES_MODULE}.{script_to_config}"
+            module = sys.modules.get(module_path)
+            if module is not None:
+                script_module = importlib.reload(module)
+            else:
+                script_module = importlib.import_module(f".{script_to_config}",
+                                                        package=settings.SCRIPT_STRATEGIES_MODULE)
             config_class = next((member for member_name, member in inspect.getmembers(script_module)
                                  if
                                  inspect.isclass(member) and member not in [BaseClientModel, StrategyV2ConfigBase] and

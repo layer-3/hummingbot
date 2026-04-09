@@ -45,7 +45,6 @@ class YellowProAPIOrderBookDataSource(OrderBookTrackerDataSource):
             path_url=CONSTANTS.SNAPSHOT_REST_URL,
             params=params,
             limit_id=CONSTANTS.SNAPSHOT_REST_URL,
-            is_auth_required=True,
         )
         snapshot = snapshot or {}
         snapshot.setdefault("bids", [])
@@ -68,6 +67,7 @@ class YellowProAPIOrderBookDataSource(OrderBookTrackerDataSource):
         while True:
             try:
                 ws = await self._connected_websocket_assistant()
+                self._ws_assistant = ws
                 await self._subscribe_channels(ws)
                 self.logger().info("Subscribed to YellowPro order book channels.")
                 await self._process_websocket_messages(websocket_assistant=ws)
@@ -82,6 +82,7 @@ class YellowProAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 )
                 await self._sleep(5.0)
             finally:
+                self._ws_assistant = None
                 await self._on_order_stream_interruption(websocket_assistant=ws)
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
@@ -119,9 +120,11 @@ class YellowProAPIOrderBookDataSource(OrderBookTrackerDataSource):
             raise
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        if "push" not in raw_message:
+        push = raw_message.get("push", {})
+        pub = push.get("pub", {})
+        payload = pub.get("data")
+        if not payload:
             return
-        payload = raw_message["push"]["pub"]["data"]
         exchange_symbol = payload.get("market")
         trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=exchange_symbol)
         header = payload.get("header", {})
@@ -129,7 +132,7 @@ class YellowProAPIOrderBookDataSource(OrderBookTrackerDataSource):
             "trading_pair": trading_pair,
             "bids": payload.get("bids", []),
             "asks": payload.get("asks", []),
-            "sequence_num": payload["sequence_num"],
+            "sequence_num": payload.get("sequence_num", 0),
             "created_at": header.get("created_at"),
         }
         diff_msg = YellowProOrderBook.diff_message_from_exchange(diff_payload)
@@ -155,9 +158,11 @@ class YellowProAPIOrderBookDataSource(OrderBookTrackerDataSource):
         message_queue.put_nowait(snapshot_msg)
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        if "push" not in raw_message:
+        push = raw_message.get("push", {})
+        pub = push.get("pub", {})
+        payload = pub.get("data")
+        if not payload:
             return
-        payload = raw_message["push"]["pub"]["data"]
         exchange_symbol = payload.get("market")
         trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=exchange_symbol)
         trade_payload = {

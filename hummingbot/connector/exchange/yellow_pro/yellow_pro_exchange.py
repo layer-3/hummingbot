@@ -38,7 +38,7 @@ class YellowProExchange(ExchangePyBase):
     web_utils = web_utils
 
     SHORT_POLL_INTERVAL = 5.0
-    LONG_POLL_INTERVAL = 120.0
+    LONG_POLL_INTERVAL = 10.0
     ORDER_SNAPSHOT_CACHE_TTL = SHORT_POLL_INTERVAL
     TRADE_SNAPSHOT_CACHE_TTL = SHORT_POLL_INTERVAL
     MAX_TRADE_HISTORY_PAGES = 5
@@ -209,14 +209,13 @@ class YellowProExchange(ExchangePyBase):
         )
 
     async def _make_trading_rules_request(self) -> Dict[str, Any]:
-        return await self._api_get(path_url=self.trading_rules_request_path, is_auth_required=True)
+        return await self._api_get(path_url=self.trading_rules_request_path)
 
     async def _make_trading_pairs_request(self) -> Dict[str, Any]:
         try:
             response = await self._api_get(
                 path_url=self.trading_pairs_request_path,
                 params=None,
-                is_auth_required=True,
                 limit_id=self.trading_pairs_request_path,
             )
         except Exception as request_err:
@@ -247,17 +246,29 @@ class YellowProExchange(ExchangePyBase):
             if base is None or quote is None:
                 continue
             trading_pair = combine_to_hb_trading_pair(base.upper(), quote.upper())
+
+            # Parse filters returned by the exchange
+            filters = {f["filter_type"]: f.get("config", {}) for f in symbol_info.get("filters", [])}
+            lot_size = filters.get("LOT_SIZE", {})
+            price_filter = filters.get("PRICE_FILTER", {})
+            min_notional_filter = filters.get("MIN_NOTIONAL", {})
+
+            # Fallbacks from precision fields
             base_precision = Decimal(10) ** -Decimal(symbol_info.get("base_asset_precision", 8))
             quote_precision = Decimal(10) ** -Decimal(symbol_info.get("quote_asset_precision", 8))
-            min_order_size = max(base_precision, Decimal(str(symbol_info.get("min_quantity", base_precision))))
-            min_price_increment = quote_precision
+
+            step_size = Decimal(str(lot_size["step_size"])) if "step_size" in lot_size else base_precision
+            min_order_size = Decimal(str(lot_size["min_qty"])) if "min_qty" in lot_size else base_precision
+            min_price_increment = Decimal(str(price_filter["tick_size"])) if "tick_size" in price_filter else quote_precision
+            min_notional = Decimal(str(min_notional_filter["min_notional"])) if "min_notional" in min_notional_filter else s_decimal_0
+
             rules.append(
                 TradingRule(
                     trading_pair=trading_pair,
                     min_order_size=min_order_size,
                     min_price_increment=min_price_increment,
-                    min_base_amount_increment=base_precision,
-                    min_notional_size=s_decimal_0,
+                    min_base_amount_increment=step_size,
+                    min_notional_size=min_notional,
                 )
             )
         return rules
@@ -299,8 +310,7 @@ class YellowProExchange(ExchangePyBase):
             tasks.append(self._api_get(
                 path_url=CONSTANTS.TICKER_PRICE_CHANGE_URL,
                 params={"symbol": symbol},
-                limit_id=CONSTANTS.TICKER_PRICE_CHANGE_URL,
-                is_auth_required=True))
+                limit_id=CONSTANTS.TICKER_PRICE_CHANGE_URL))
         responses = await safe_gather(*tasks, return_exceptions=True)
         for symbol, response in zip(symbols, responses):
             if isinstance(response, Exception):
@@ -329,7 +339,6 @@ class YellowProExchange(ExchangePyBase):
                     path_url=CONSTANTS.TICKER_PRICE_CHANGE_URL,
                     params={"symbol": symbol},
                     limit_id=CONSTANTS.TICKER_PRICE_CHANGE_URL,
-                    is_auth_required=True,
                 )
             )
         responses = await safe_gather(*tasks, return_exceptions=True)
@@ -346,10 +355,12 @@ class YellowProExchange(ExchangePyBase):
         return results
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
-        return CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(status_update_exception)
+        error_str = str(status_update_exception).lower()
+        return "not found" in error_str or CONSTANTS.ORDER_NOT_EXIST_MESSAGE in error_str
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
-        return CONSTANTS.UNKNOWN_ORDER_MESSAGE in str(cancelation_exception)
+        error_str = str(cancelation_exception).lower()
+        return "not found" in error_str or CONSTANTS.UNKNOWN_ORDER_MESSAGE in error_str
 
     def quantize_order_price(self, trading_pair: str, price: Decimal) -> Decimal:
         trading_rule = self._trading_rules.get(trading_pair)
@@ -819,6 +830,18 @@ class YellowProExchange(ExchangePyBase):
                 normalized_event_type = str(event_type or "").lower()
                 if normalized_event_type in {"order.updated", "order.cancelled", "order.canceled", "order.expired"}:
                     await self._handle_order_update_event(data)
+                elif normalized_event_type == "trade.executed":
+                    # Normalize WS field names to match REST format
+                    if "order_uuid" not in data and "order_id" in data:
+                        data["order_uuid"] = data["order_id"]
+                    if "id" not in data and "trade_id" in data:
+                        data["id"] = data["trade_id"]
+                    # Add to dedup set so REST polling doesn't reprocess
+                    trade_id = str(data.get("id") or data.get("trade_id") or "")
+                    if trade_id and trade_id not in self._processed_trade_ids_lookup:
+                        self._processed_trade_ids.append(trade_id)
+                        self._processed_trade_ids_lookup.add(trade_id)
+                    await self._process_rest_trade(data)
                 elif normalized_event_type in {
                         "margin_account.balance_update",
                         "spot_account.balance_update"}:
@@ -839,11 +862,13 @@ class YellowProExchange(ExchangePyBase):
         self._account_balances[asset] = total
 
     async def _handle_order_update_event(self, event: Dict[str, Any]):
-        order_uuid = event.get("uuid") or event.get("order_uuid")
+        # WS events may use "order_id" (UUID) instead of "uuid"/"order_uuid"
+        order_uuid = event.get("uuid") or event.get("order_uuid") or event.get("order_id")
         if order_uuid is None:
             return
         exchange_order_id = str(order_uuid)
-        numeric_id = event.get("id")
+        # Cache numeric ID for trade matching (WS may omit this)
+        numeric_id = event.get("id") or event.get("numeric_id")
         if numeric_id is not None:
             self._order_numeric_ids[exchange_order_id] = str(numeric_id)
         tracked_order = self._order_tracker.all_updatable_orders_by_exchange_order_id.get(exchange_order_id)
@@ -856,11 +881,6 @@ class YellowProExchange(ExchangePyBase):
                 trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=market)
             except Exception:
                 trading_pair = tracked_order.trading_pair
-        remaining = Decimal(event.get("amount", "0"))
-        origin = Decimal(event.get("origin_amount", remaining))
-        filled_total = origin - remaining
-        executed_diff = filled_total - tracked_order.executed_amount_base
-        price = Decimal(event.get("price", tracked_order.price or s_decimal_0))
         header = event.get("header", {})
         timestamp = header.get("created_at")
         update_timestamp = self._parse_iso_timestamp(timestamp) if timestamp else self.current_timestamp
@@ -876,26 +896,8 @@ class YellowProExchange(ExchangePyBase):
             exchange_order_id=exchange_order_id,
         )
         self._order_tracker.process_order_update(order_update)
-
-        if executed_diff > Decimal("0"):
-            is_maker = self._is_maker_from_payload(event)
-            fee = TradeFeeBase.new_spot_fee(
-                fee_schema=self.trade_fee_schema(),
-                trade_type=tracked_order.trade_type,
-                percent=self.estimate_fee_pct(is_maker),
-            )
-            trade_update = TradeUpdate(
-                trade_id=str(event.get("id") or header.get("id") or exchange_order_id),
-                client_order_id=tracked_order.client_order_id,
-                exchange_order_id=exchange_order_id,
-                trading_pair=trading_pair,
-                fill_base_amount=executed_diff,
-                fill_quote_amount=executed_diff * price,
-                fill_price=price,
-                fee=fee,
-                fill_timestamp=update_timestamp,
-            )
-            self._order_tracker.process_trade_update(trade_update)
+        # Note: fill detection is handled by trade.executed WS events via _process_rest_trade,
+        # not synthesized here, to avoid duplicate fills with non-deterministic trade IDs.
 
     async def _update_trade_history(self):
         trades = await self._download_trades_snapshot(force_refresh=True)
@@ -911,30 +913,36 @@ class YellowProExchange(ExchangePyBase):
             await self._process_rest_trade(trade)
 
     async def _process_rest_trade(self, trade: Dict[str, Any]):
-        order_uuid = trade.get("order_uuid")
+        # Try UUID-based lookup first (REST uses "order_uuid", WS uses "order_id")
+        order_uuid = trade.get("order_uuid") or trade.get("order_id")
         tracked_order = None
         if order_uuid is not None:
             tracked_order = self._order_tracker.all_fillable_orders_by_exchange_order_id.get(str(order_uuid))
+        # Fallback: numeric ID lookup
         if tracked_order is None:
-            numeric_order_id = str(trade.get("order_id"))
-            for exchange_id, stored_numeric_id in self._order_numeric_ids.items():
-                if stored_numeric_id == numeric_order_id:
-                    tracked_order = self._order_tracker.all_fillable_orders_by_exchange_order_id.get(exchange_id)
-                    break
+            numeric_order_id = str(trade.get("order_id") or "")
+            if numeric_order_id:
+                for exchange_id, stored_numeric_id in self._order_numeric_ids.items():
+                    if stored_numeric_id == numeric_order_id:
+                        tracked_order = self._order_tracker.all_fillable_orders_by_exchange_order_id.get(exchange_id)
+                        break
         if tracked_order is None:
             return
         trading_pair = tracked_order.trading_pair
         amount = Decimal(trade.get("amount", "0"))
         price = Decimal(trade.get("price", "0"))
         is_maker = self._is_maker_from_payload(trade)
-        executed_at = self._parse_iso_timestamp(trade.get("executed_at"))
+        executed_at = self._parse_iso_timestamp(
+            trade.get("executed_at") or trade.get("timestamp") or trade.get("created_at")
+        )
         fee = TradeFeeBase.new_spot_fee(
             fee_schema=self.trade_fee_schema(),
             trade_type=tracked_order.trade_type,
             percent=self.estimate_fee_pct(is_maker),
         )
+        trade_id = str(trade.get("id") or trade.get("trade_id") or "")
         trade_update = TradeUpdate(
-            trade_id=str(trade.get("id")),
+            trade_id=trade_id,
             client_order_id=tracked_order.client_order_id,
             exchange_order_id=tracked_order.exchange_order_id,
             trading_pair=trading_pair,
@@ -1002,7 +1010,7 @@ class YellowProExchange(ExchangePyBase):
         await safe_gather(
             self._update_trade_history(),
             self._update_order_status(),
-            self._update_balances(),
+            self._update_all_balances(),
         )
 
     @staticmethod

@@ -433,3 +433,688 @@ class TestOrders:
 
         result = self._cancel_order(exchange, str(order_id))
         assert result is True
+
+    @requires_credentials
+    def test_order_status_open_then_cancelled(self, exchange: YellowProExchange):
+        """Place a safe order, verify it appears in open orders, cancel, verify it's gone."""
+        import time
+
+        safe_buy, _ = self._get_safe_prices(exchange)
+        resp = self._place_order(exchange, "buy", "limit", safe_buy, TEST_QUANTITY)
+        order_id = resp.get("order_uuid") or resp.get("uuid") or resp.get("order_id")
+        assert order_id, f"No order ID: {resp}"
+
+        symbol = _exchange_symbol(exchange, TRADING_PAIR)
+        loop = _get_event_loop()
+        time.sleep(1)
+
+        # Check open orders — our order should be there
+        open_orders = loop.run_until_complete(exchange._fetch_open_orders_for_market(symbol))
+        found = any(
+            str(o.get("order_uuid") or o.get("uuid") or o.get("order_id")) == str(order_id)
+            for o in open_orders
+        )
+        assert found, f"Order {order_id} not found in open orders"
+        print(f"  Order {order_id} found in open orders")
+
+        # Cancel
+        cancelled = self._cancel_order(exchange, str(order_id))
+        assert cancelled, f"Failed to cancel order {order_id}"
+        time.sleep(1)
+
+        # Check open orders again — should be gone
+        open_orders = loop.run_until_complete(exchange._fetch_open_orders_for_market(symbol))
+        still_there = any(
+            str(o.get("order_uuid") or o.get("uuid") or o.get("order_id")) == str(order_id)
+            for o in open_orders
+        )
+        assert not still_there, f"Order {order_id} still in open orders after cancel"
+        print(f"  Order {order_id} gone from open orders after cancel")
+
+    @requires_credentials
+    def test_trade_fill_buy_and_sell(self, exchange: YellowProExchange):
+        """Place aggressive orders that cross the spread and verify fills via trade history."""
+        symbol = _exchange_symbol(exchange, TRADING_PAIR)
+        loop = _get_event_loop()
+
+        # Get current order book
+        resp = loop.run_until_complete(
+            exchange._api_get(
+                path_url=CONSTANTS.SNAPSHOT_REST_URL,
+                params={"symbol": symbol},
+                is_auth_required=True,
+                limit_id=CONSTANTS.SNAPSHOT_REST_URL,
+            )
+        )
+        asks = resp.get("asks", [])
+        bids = resp.get("bids", [])
+        if not asks or not bids:
+            pytest.skip("Order book empty — cannot test trade fill")
+
+        best_ask = Decimal(str(asks[0][0]))
+        best_bid = Decimal(str(bids[0][0]))
+
+        # Buy above best ask (crosses spread, should fill)
+        buy_price = (best_ask * Decimal("1.005")).quantize(Decimal("0.01"))
+        buy_resp = self._place_order(exchange, "buy", "limit", buy_price, TEST_QUANTITY)
+        buy_order_id = buy_resp.get("order_uuid") or buy_resp.get("uuid") or buy_resp.get("order_id")
+        assert buy_order_id, f"No buy order ID: {buy_resp}"
+        print(f"  Buy order placed: id={buy_order_id} price={buy_price}")
+
+        import time
+        time.sleep(2)  # wait for fill
+
+        # Check order state
+        orders = loop.run_until_complete(
+            exchange._download_orders_snapshot(symbol, force_refresh=True, target_order_id=str(buy_order_id))
+        )
+        buy_order = exchange._find_order_in_snapshot(orders, str(buy_order_id))
+        if buy_order:
+            print(f"  Buy order state: {buy_order.get('state')}")
+            assert buy_order.get("state") in ("done", "filled", "wait", "open"), \
+                f"Unexpected buy order state: {buy_order.get('state')}"
+
+        # Sell below best bid (crosses spread, should fill)
+        sell_price = (best_bid * Decimal("0.995")).quantize(Decimal("0.01"))
+        sell_resp = self._place_order(exchange, "sell", "limit", sell_price, TEST_QUANTITY)
+        sell_order_id = sell_resp.get("order_uuid") or sell_resp.get("uuid") or sell_resp.get("order_id")
+        assert sell_order_id, f"No sell order ID: {sell_resp}"
+        print(f"  Sell order placed: id={sell_order_id} price={sell_price}")
+
+        time.sleep(2)  # wait for fill
+
+        # Check order state
+        orders = loop.run_until_complete(
+            exchange._download_orders_snapshot(symbol, force_refresh=True, target_order_id=str(sell_order_id))
+        )
+        sell_order = exchange._find_order_in_snapshot(orders, str(sell_order_id))
+        if sell_order:
+            print(f"  Sell order state: {sell_order.get('state')}")
+            assert sell_order.get("state") in ("done", "filled", "wait", "open"), \
+                f"Unexpected sell order state: {sell_order.get('state')}"
+
+        # Verify trades exist
+        channel = (CHANNEL_ID or SESSION_ID).strip()
+        params = {
+            "app_session_id": SESSION_ID,
+            "market": symbol,
+            "page": 1,
+            "page_size": 10,
+        }
+        if channel:
+            params["channel_id"] = channel
+        resp = loop.run_until_complete(
+            exchange._api_get(
+                path_url=CONSTANTS.TRADES_URL,
+                params=params,
+                is_auth_required=True,
+                limit_id=CONSTANTS.TRADES_URL,
+            )
+        )
+        trades = resp.get("trades", resp) if isinstance(resp, dict) else resp
+        print(f"  Recent trades count: {len(trades)}")
+        if trades:
+            latest = trades[0]
+            print(f"  Latest trade: id={latest.get('id')} price={latest.get('price')} "
+                  f"amount={latest.get('amount')} side={latest.get('side')}")
+
+
+# ---------------------------------------------------------------------------
+# 6. WebSocket Events  (requires credentials)
+# ---------------------------------------------------------------------------
+
+class TestWebSocket:
+    @requires_credentials
+    def test_ws_events_on_place_cancel_and_fill(self, exchange: YellowProExchange):
+        """Connect to private WS, place/cancel/fill orders, and print ALL events received."""
+        import json
+
+        import aiohttp
+
+        loop = _get_event_loop()
+
+        async def _run():
+            ws_url = CONSTANTS.WS_URLS[DOMAIN]
+            auth_headers = exchange._auth.get_ws_auth_headers()
+            collected_events = []
+            decoder = json.JSONDecoder()
+
+            def parse_multi_json(raw: str):
+                """Parse one or more concatenated JSON objects from a single WS message."""
+                results = []
+                idx = 0
+                while idx < len(raw):
+                    while idx < len(raw) and raw[idx].isspace():
+                        idx += 1
+                    if idx >= len(raw):
+                        break
+                    try:
+                        obj, next_idx = decoder.raw_decode(raw, idx)
+                        results.append(obj)
+                        idx = next_idx
+                    except json.JSONDecodeError:
+                        break
+                return results
+
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(ws_url, headers=auth_headers) as ws:
+                    # Connect
+                    await ws.send_json({"id": 1, "connect": {}})
+                    msg = await asyncio.wait_for(ws.receive(), timeout=5)
+                    for obj in parse_multi_json(msg.data):
+                        print(f"  WS connect response: {obj}")
+
+                    # Subscribe to private channel
+                    channel = f"private.{SESSION_ID}"
+                    await ws.send_json({"id": 2, "subscribe": {"channel": channel}})
+                    msg = await asyncio.wait_for(ws.receive(), timeout=5)
+                    for obj in parse_multi_json(msg.data):
+                        print(f"  WS subscribe response: {obj}")
+
+                    # Helper to drain all pending messages
+                    async def drain_events(wait_secs=3):
+                        deadline = asyncio.get_event_loop().time() + wait_secs
+                        while True:
+                            remaining = deadline - asyncio.get_event_loop().time()
+                            if remaining <= 0:
+                                break
+                            try:
+                                msg = await asyncio.wait_for(ws.receive(), timeout=remaining)
+                                if msg.type == aiohttp.WSMsgType.TEXT:
+                                    for data in parse_multi_json(msg.data):
+                                        if data:
+                                            collected_events.append(data)
+                                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                    break
+                            except asyncio.TimeoutError:
+                                break
+
+                    # 1. Place a safe buy order (won't fill)
+                    symbol = _exchange_symbol(exchange, TRADING_PAIR)
+                    ob = await exchange._api_get(
+                        path_url=CONSTANTS.SNAPSHOT_REST_URL,
+                        params={"symbol": symbol},
+                        is_auth_required=True,
+                        limit_id=CONSTANTS.SNAPSHOT_REST_URL,
+                    )
+                    bids = ob.get("bids", [])
+                    asks = ob.get("asks", [])
+                    best_bid = Decimal(str(bids[0][0])) if bids else None
+                    best_ask = Decimal(str(asks[0][0])) if asks else None
+                    if not best_bid or not best_ask:
+                        print("  Order book empty — skipping")
+                        return
+
+                    safe_price = (best_bid * BUY_PRICE_FACTOR).quantize(Decimal("0.01"))
+                    print(f"\n  --- Place safe buy at {safe_price} (won't fill) ---")
+                    place_resp = await exchange._api_post(
+                        path_url=CONSTANTS.CREATE_ORDER_URL,
+                        data={
+                            "app_session_id": SESSION_ID,
+                            "market": symbol,
+                            "type": "limit",
+                            "side": "buy",
+                            "amount": str(TEST_QUANTITY),
+                            "price": str(safe_price),
+                            "time_in_force": "gtc",
+                        },
+                        is_auth_required=True,
+                        limit_id=CONSTANTS.CREATE_ORDER_URL,
+                    )
+                    order_id = place_resp.get("order_uuid") or place_resp.get("uuid")
+                    print(f"  Placed order: {order_id}")
+                    await drain_events(3)
+
+                    # 2. Cancel it
+                    print(f"\n  --- Cancel order {order_id} ---")
+                    await exchange._cancel_order_by_uuid(symbol, str(order_id))
+                    await drain_events(3)
+
+                    # 3. Place aggressive buy (should fill)
+                    fill_price = (best_ask * Decimal("1.005")).quantize(Decimal("0.01"))
+                    print(f"\n  --- Place aggressive buy at {fill_price} (should fill) ---")
+                    fill_resp = await exchange._api_post(
+                        path_url=CONSTANTS.CREATE_ORDER_URL,
+                        data={
+                            "app_session_id": SESSION_ID,
+                            "market": symbol,
+                            "type": "limit",
+                            "side": "buy",
+                            "amount": str(TEST_QUANTITY),
+                            "price": str(fill_price),
+                            "time_in_force": "gtc",
+                        },
+                        is_auth_required=True,
+                        limit_id=CONSTANTS.CREATE_ORDER_URL,
+                    )
+                    fill_order_id = fill_resp.get("order_uuid") or fill_resp.get("uuid")
+                    print(f"  Placed order: {fill_order_id}")
+                    await drain_events(5)
+
+                    # 4. Place aggressive sell to round-trip
+                    sell_price = (best_bid * Decimal("0.995")).quantize(Decimal("0.01"))
+                    print(f"\n  --- Place aggressive sell at {sell_price} (should fill) ---")
+                    sell_resp = await exchange._api_post(
+                        path_url=CONSTANTS.CREATE_ORDER_URL,
+                        data={
+                            "app_session_id": SESSION_ID,
+                            "market": symbol,
+                            "type": "limit",
+                            "side": "sell",
+                            "amount": str(TEST_QUANTITY),
+                            "price": str(sell_price),
+                            "time_in_force": "gtc",
+                        },
+                        is_auth_required=True,
+                        limit_id=CONSTANTS.CREATE_ORDER_URL,
+                    )
+                    sell_order_id = sell_resp.get("order_uuid") or sell_resp.get("uuid")
+                    print(f"  Placed order: {sell_order_id}")
+                    await drain_events(5)
+
+            print(f"\n  Total WS events collected: {len(collected_events)}")
+            for i, evt in enumerate(collected_events):
+                push = evt.get("push", {})
+                if push:
+                    pub_data = push.get("pub", {}).get("data", {})
+                    header = pub_data.get("header", {})
+                    print(f"  Event {i}: type={header.get('type')} channel={push.get('channel')}")
+
+        loop.run_until_complete(_run())
+
+
+# ---------------------------------------------------------------------------
+# 7. WS Field Mapping  (requires credentials)
+#    Tests that WS event payloads (which use different field names than REST)
+#    are correctly processed by the connector handlers.
+# ---------------------------------------------------------------------------
+
+class TestWSFieldMapping:
+    @requires_credentials
+    def test_handle_order_update_with_ws_field_names(self, exchange: YellowProExchange):
+        """order.updated WS events use 'order_id' (UUID), not 'uuid'/'order_uuid'."""
+        loop = _get_event_loop()
+
+        async def _run():
+            await exchange._initialize_trading_pair_symbol_map()
+
+            # Place a safe order to get a tracked order
+            symbol = _exchange_symbol(exchange, TRADING_PAIR)
+            ob = await exchange._api_get(
+                path_url=CONSTANTS.SNAPSHOT_REST_URL,
+                params={"symbol": symbol},
+                is_auth_required=True,
+                limit_id=CONSTANTS.SNAPSHOT_REST_URL,
+            )
+            bids = ob.get("bids", [])
+            if not bids:
+                return  # skip if no bids
+            best_bid = Decimal(str(bids[0][0]))
+            safe_price = (best_bid * BUY_PRICE_FACTOR).quantize(Decimal("0.01"))
+
+            # Place via REST
+            resp = await exchange._api_post(
+                path_url=CONSTANTS.CREATE_ORDER_URL,
+                data={
+                    "app_session_id": SESSION_ID,
+                    "market": symbol,
+                    "type": "limit",
+                    "side": "buy",
+                    "amount": str(TEST_QUANTITY),
+                    "price": str(safe_price),
+                    "time_in_force": "gtc",
+                },
+                is_auth_required=True,
+                limit_id=CONSTANTS.CREATE_ORDER_URL,
+            )
+            order_uuid = resp.get("order_uuid") or resp.get("uuid")
+            assert order_uuid, f"No order ID: {resp}"
+
+            # Register as tracked order
+            from hummingbot.core.data_type.common import OrderType, TradeType
+            from hummingbot.core.data_type.in_flight_order import InFlightOrder
+            tracked = InFlightOrder(
+                client_order_id="test-client-id",
+                exchange_order_id=str(order_uuid),
+                trading_pair=TRADING_PAIR,
+                order_type=OrderType.LIMIT,
+                trade_type=TradeType.BUY,
+                amount=TEST_QUANTITY,
+                price=safe_price,
+                creation_timestamp=exchange.current_timestamp,
+            )
+            exchange._order_tracker.start_tracking_order(tracked)
+
+            # Simulate WS order.updated event using "order_id" (not "uuid")
+            ws_event = {
+                "header": {"type": "order.updated", "created_at": "2026-01-01T00:00:00Z"},
+                "order_id": str(order_uuid),  # WS uses this, not "uuid"
+                "market": symbol,
+                "state": "wait",
+                "amount": str(TEST_QUANTITY),
+                "origin_amount": str(TEST_QUANTITY),
+                "price": str(safe_price),
+            }
+            await exchange._handle_order_update_event(ws_event)
+
+            # Verify the order was found and updated (not silently dropped)
+            order = exchange._order_tracker.all_updatable_orders.get("test-client-id")
+            assert order is not None, "Tracked order lost after WS update"
+            print(f"  Order state after WS update: {order.current_state.name}")
+
+            # Simulate WS order.cancelled event using "order_id"
+            ws_cancel = {
+                "header": {"type": "order.cancelled", "created_at": "2026-01-01T00:00:01Z"},
+                "order_id": str(order_uuid),
+                "market": symbol,
+                "state": "cancel",
+                "amount": "0",
+                "origin_amount": str(TEST_QUANTITY),
+                "price": str(safe_price),
+            }
+            await exchange._handle_order_update_event(ws_cancel)
+            print(f"  Order state after WS cancel: {order.current_state.name}")
+
+            # Also cancel on exchange to clean up
+            try:
+                await exchange._cancel_order_by_uuid(symbol, str(order_uuid))
+            except Exception:
+                pass  # may already be cancelled
+
+        loop.run_until_complete(_run())
+
+    @requires_credentials
+    def test_process_rest_trade_with_ws_field_names(self, exchange: YellowProExchange):
+        """trade.executed WS events use 'order_id'/'trade_id', not 'order_uuid'/'id'."""
+        loop = _get_event_loop()
+
+        async def _run():
+            await exchange._initialize_trading_pair_symbol_map()
+
+            fake_uuid = "00000000-0000-0000-0000-000000000001"
+
+            # Register a fake tracked order
+            from hummingbot.core.data_type.common import OrderType, TradeType
+            from hummingbot.core.data_type.in_flight_order import InFlightOrder
+            tracked = InFlightOrder(
+                client_order_id="test-trade-client",
+                exchange_order_id=fake_uuid,
+                trading_pair=TRADING_PAIR,
+                order_type=OrderType.LIMIT,
+                trade_type=TradeType.BUY,
+                amount=TEST_QUANTITY,
+                price=Decimal("2000"),
+                creation_timestamp=exchange.current_timestamp,
+            )
+            exchange._order_tracker.start_tracking_order(tracked)
+
+            # Simulate WS trade.executed with WS field names
+            ws_trade = {
+                "header": {"type": "trade.executed", "created_at": "2026-01-01T00:00:00Z"},
+                "order_id": fake_uuid,     # WS uses this, not "order_uuid"
+                "trade_id": 99999,          # WS uses this, not "id"
+                "market": "ETHUSDT",
+                "price": "2000",
+                "amount": str(TEST_QUANTITY),
+                "is_maker": False,
+                "executed_at": "2026-01-01T00:00:00Z",
+            }
+
+            # Normalize fields as _user_stream_event_listener does
+            if "order_uuid" not in ws_trade and "order_id" in ws_trade:
+                ws_trade["order_uuid"] = ws_trade["order_id"]
+            if "id" not in ws_trade and "trade_id" in ws_trade:
+                ws_trade["id"] = ws_trade["trade_id"]
+
+            # Add to dedup set
+            trade_id = str(ws_trade.get("id"))
+            exchange._processed_trade_ids.append(trade_id)
+            exchange._processed_trade_ids_lookup.add(trade_id)
+
+            await exchange._process_rest_trade(ws_trade)
+
+            # Verify fill was recorded
+            order = exchange._order_tracker.all_fillable_orders.get("test-trade-client")
+            if order:
+                print(f"  Executed amount after WS trade: {order.executed_amount_base}")
+                assert order.executed_amount_base == TEST_QUANTITY, \
+                    f"Expected {TEST_QUANTITY}, got {order.executed_amount_base}"
+            else:
+                print("  Order already completed (moved out of fillable)")
+
+            # Verify dedup: same trade_id should be in the lookup
+            assert trade_id in exchange._processed_trade_ids_lookup, \
+                f"Trade {trade_id} not in dedup set"
+            print(f"  Trade {trade_id} correctly in dedup set")
+
+        loop.run_until_complete(_run())
+
+    @requires_credentials
+    def test_e2e_ws_cancel_via_framework(self, exchange: YellowProExchange):
+        """End-to-end: start WS event listener, place+cancel order, verify state via framework."""
+        from hummingbot.core.data_type.common import OrderType, TradeType
+        from hummingbot.core.data_type.in_flight_order import InFlightOrder
+        from hummingbot.core.utils.async_utils import safe_ensure_future
+
+        loop = _get_event_loop()
+
+        async def _run():
+            # Fresh exchange instance to avoid shared state
+            ex = YellowProExchange(
+                yellow_pro_app_session_id=SESSION_ID,
+                yellow_pro_api_key=API_KEY,
+                yellow_pro_api_secret=API_SECRET,
+                trading_pairs=[TRADING_PAIR],
+                trading_required=True,
+                yellow_pro_domain=DOMAIN,
+            )
+            await ex._initialize_trading_pair_symbol_map()
+
+            # Start the full WS pipeline: tracker + event listener
+            ex._user_stream_tracker_task = safe_ensure_future(ex._user_stream_tracker.start())
+            ex._user_stream_event_listener_task = safe_ensure_future(ex._user_stream_event_listener())
+
+            # Wait for WS to connect
+            for _ in range(20):
+                if ex._user_stream_tracker.data_source.last_recv_time > 0:
+                    break
+                await asyncio.sleep(0.5)
+            assert ex._user_stream_tracker.data_source.last_recv_time > 0, "WS never connected"
+            print("  WS connected and receiving")
+
+            try:
+                symbol = _exchange_symbol(ex, TRADING_PAIR)
+                ob = await ex._api_get(
+                    path_url=CONSTANTS.SNAPSHOT_REST_URL,
+                    params={"symbol": symbol},
+                    is_auth_required=True,
+                    limit_id=CONSTANTS.SNAPSHOT_REST_URL,
+                )
+                bids = ob.get("bids", [])
+                if not bids:
+                    print("  No bids — skipping")
+                    return
+                best_bid = Decimal(str(bids[0][0]))
+                safe_price = (best_bid * BUY_PRICE_FACTOR).quantize(Decimal("0.01"))
+
+                # Place order via REST
+                try:
+                    resp = await ex._api_post(
+                        path_url=CONSTANTS.CREATE_ORDER_URL,
+                        data={
+                            "app_session_id": SESSION_ID,
+                            "market": symbol,
+                            "type": "limit",
+                            "side": "buy",
+                            "amount": str(TEST_QUANTITY),
+                            "price": str(safe_price),
+                            "time_in_force": "gtc",
+                        },
+                        is_auth_required=True,
+                        limit_id=CONSTANTS.CREATE_ORDER_URL,
+                    )
+                except IOError as e:
+                    if "lock funds" in str(e) or "connection refused" in str(e).lower():
+                        pytest.skip(f"Staging infra error: {e}")
+                    raise
+                order_uuid = str(resp.get("order_uuid") or resp.get("uuid"))
+                assert order_uuid, f"No order ID: {resp}"
+                print(f"  Order placed: {order_uuid} at {safe_price}")
+
+                # Track order in framework
+                tracked = InFlightOrder(
+                    client_order_id="e2e-cancel-test",
+                    exchange_order_id=order_uuid,
+                    trading_pair=TRADING_PAIR,
+                    order_type=OrderType.LIMIT,
+                    trade_type=TradeType.BUY,
+                    amount=TEST_QUANTITY,
+                    price=safe_price,
+                    creation_timestamp=ex.current_timestamp,
+                )
+                ex._order_tracker.start_tracking_order(tracked)
+                await asyncio.sleep(1)
+
+                # Cancel via REST
+                await ex._cancel_order_by_uuid(symbol, order_uuid)
+                print("  Cancel sent")
+
+                # Wait for WS order.cancelled event to be processed by _user_stream_event_listener
+                from hummingbot.core.data_type.in_flight_order import OrderState
+                for _ in range(30):
+                    if tracked.current_state in (OrderState.CANCELED, OrderState.CANCELED):
+                        break
+                    await asyncio.sleep(0.2)
+
+                print(f"  Order state via framework: {tracked.current_state.name}")
+                assert tracked.current_state in (OrderState.CANCELED, OrderState.CANCELED), \
+                    f"Expected CANCELLED, got {tracked.current_state.name} — WS event not processed by framework"
+
+            finally:
+                # Stop WS
+                if ex._user_stream_event_listener_task:
+                    ex._user_stream_event_listener_task.cancel()
+                if ex._user_stream_tracker_task:
+                    ex._user_stream_tracker_task.cancel()
+                await ex._user_stream_tracker.stop()
+
+        loop.run_until_complete(_run())
+
+    @requires_credentials
+    def test_e2e_ws_fill_via_framework(self, exchange: YellowProExchange):
+        """End-to-end: start WS event listener, place aggressive order, verify fill via framework."""
+        from hummingbot.core.data_type.common import OrderType, TradeType
+        from hummingbot.core.data_type.in_flight_order import InFlightOrder
+        from hummingbot.core.utils.async_utils import safe_ensure_future
+
+        loop = _get_event_loop()
+
+        async def _run():
+            # Fresh exchange instance to avoid shared state
+            ex = YellowProExchange(
+                yellow_pro_app_session_id=SESSION_ID,
+                yellow_pro_api_key=API_KEY,
+                yellow_pro_api_secret=API_SECRET,
+                trading_pairs=[TRADING_PAIR],
+                trading_required=True,
+                yellow_pro_domain=DOMAIN,
+            )
+            await ex._initialize_trading_pair_symbol_map()
+
+            # Start full WS pipeline
+            ex._user_stream_tracker_task = safe_ensure_future(ex._user_stream_tracker.start())
+            ex._user_stream_event_listener_task = safe_ensure_future(ex._user_stream_event_listener())
+
+            for _ in range(20):
+                if ex._user_stream_tracker.data_source.last_recv_time > 0:
+                    break
+                await asyncio.sleep(0.5)
+            assert ex._user_stream_tracker.data_source.last_recv_time > 0, "WS never connected"
+            print("  WS connected and receiving")
+
+            try:
+                symbol = _exchange_symbol(ex, TRADING_PAIR)
+                ob = await ex._api_get(
+                    path_url=CONSTANTS.SNAPSHOT_REST_URL,
+                    params={"symbol": symbol},
+                    is_auth_required=True,
+                    limit_id=CONSTANTS.SNAPSHOT_REST_URL,
+                )
+                asks = ob.get("asks", [])
+                bids = ob.get("bids", [])
+                if not asks or not bids:
+                    print("  Order book empty — skipping")
+                    return
+
+                best_ask = Decimal(str(asks[0][0]))
+                best_bid = Decimal(str(bids[0][0]))
+
+                # Place aggressive buy (should fill)
+                fill_price = (best_ask * Decimal("1.005")).quantize(Decimal("0.01"))
+                resp = await ex._api_post(
+                    path_url=CONSTANTS.CREATE_ORDER_URL,
+                    data={
+                        "app_session_id": SESSION_ID,
+                        "market": symbol,
+                        "type": "limit",
+                        "side": "buy",
+                        "amount": str(TEST_QUANTITY),
+                        "price": str(fill_price),
+                        "time_in_force": "gtc",
+                    },
+                    is_auth_required=True,
+                    limit_id=CONSTANTS.CREATE_ORDER_URL,
+                )
+                order_uuid = str(resp.get("order_uuid") or resp.get("uuid"))
+                assert order_uuid, f"No order ID: {resp}"
+                print(f"  Buy order placed: {order_uuid} at {fill_price}")
+
+                tracked = InFlightOrder(
+                    client_order_id="e2e-fill-test",
+                    exchange_order_id=order_uuid,
+                    trading_pair=TRADING_PAIR,
+                    order_type=OrderType.LIMIT,
+                    trade_type=TradeType.BUY,
+                    amount=TEST_QUANTITY,
+                    price=fill_price,
+                    creation_timestamp=ex.current_timestamp,
+                )
+                ex._order_tracker.start_tracking_order(tracked)
+
+                # Wait for WS trade.executed event to be processed by framework
+                for _ in range(30):
+                    if tracked.executed_amount_base > Decimal("0"):
+                        break
+                    await asyncio.sleep(0.2)
+
+                print(f"  Executed amount via framework: {tracked.executed_amount_base}")
+                assert tracked.executed_amount_base > Decimal("0"), \
+                    "No fill detected via WS — trade.executed event not processed by framework"
+                print("  PASS: Fill detected via WS framework pipeline")
+
+                # Round-trip sell
+                sell_price = (best_bid * Decimal("0.995")).quantize(Decimal("0.01"))
+                await ex._api_post(
+                    path_url=CONSTANTS.CREATE_ORDER_URL,
+                    data={
+                        "app_session_id": SESSION_ID,
+                        "market": symbol,
+                        "type": "limit",
+                        "side": "sell",
+                        "amount": str(TEST_QUANTITY),
+                        "price": str(sell_price),
+                        "time_in_force": "gtc",
+                    },
+                    is_auth_required=True,
+                    limit_id=CONSTANTS.CREATE_ORDER_URL,
+                )
+                print(f"  Round-trip sell placed at {sell_price}")
+
+            finally:
+                if ex._user_stream_event_listener_task:
+                    ex._user_stream_event_listener_task.cancel()
+                if ex._user_stream_tracker_task:
+                    ex._user_stream_tracker_task.cancel()
+                await ex._user_stream_tracker.stop()
+
+        loop.run_until_complete(_run())

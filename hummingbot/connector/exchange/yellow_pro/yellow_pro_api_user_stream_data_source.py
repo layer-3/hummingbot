@@ -77,14 +77,13 @@ class YellowProAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 trimmed = raw_message[idx:idx + 200]
                 self.logger().error(f"Failed to decode JSON fragment starting at index {idx}: {e}")
                 self.logger().error(f"Fragment content (trimmed): {trimmed}")
-                fragments.clear()
                 break
             fragments.append(parsed_obj)
             idx = next_idx
         return fragments
 
     async def _process_event_message(self, event_message: Dict[str, Any], queue: asyncio.Queue):
-        if not event_message:
+        if event_message is None:
             return
         # Centrifugo server ping: empty dict → reply with empty dict
         if isinstance(event_message, dict) and len(event_message) == 0:
@@ -112,6 +111,10 @@ class YellowProAPIUserStreamDataSource(UserStreamTrackerDataSource):
             return
         if "error" in event_message:
             error_payload = event_message.get("error")
+            error_code = error_payload.get("code") if isinstance(error_payload, dict) else None
+            if error_code == 105:
+                # "already subscribed" is harmless — ignore it
+                return
             raise IOError(f"YellowPro user stream error: {error_payload}")
         if "connect" in event_message:
             return
