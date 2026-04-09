@@ -46,17 +46,10 @@ class YellowProExchangeTests(IsolatedAsyncioWrapperTestCase):
         self.assertFalse(self.exchange._normalize_bool("0"))
         self.assertIsNone(self.exchange._normalize_bool("unknown"))
 
-    def test_is_maker_from_payload_uses_channel_reference(self):
-        self.exchange._channel_id = "channel-1"
-        payload = {"maker_id": "channel-1"}
-
-        self.assertTrue(self.exchange._is_maker_from_payload(payload))
-
-    def test_orders_cache_key_includes_market_and_channel(self):
-        self.exchange._channel_id = "Channel"
+    def test_orders_cache_key_includes_market_and_session(self):
         key = self.exchange._orders_cache_key(self.exchange_symbol)
 
-        self.assertEqual(f"{self.exchange_symbol}:channel", key)
+        self.assertEqual(f"{self.exchange_symbol}:session-id", key)
 
     async def test_get_last_traded_prices_fetches_remote_price(self):
         price_payload = {"last": "101.5"}
@@ -66,33 +59,6 @@ class YellowProExchangeTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual({self.trading_pair: 101.5}, prices)
         self.exchange._api_get.assert_awaited_once()
-
-    async def test_get_positions_uses_provided_channel_id(self):
-        positions_payload = [{"channelID": "channel-1"}]
-        self.exchange._api_get = AsyncMock(return_value=positions_payload)
-
-        result = await self.exchange.get_positions("channel-1")
-
-        self.assertEqual(positions_payload, result)
-        kwargs = self.exchange._api_get.call_args.kwargs
-        self.assertEqual(CONSTANTS.POSITIONS_URL, kwargs["path_url"])
-        self.assertEqual({"channel_id": "channel-1"}, kwargs["params"])
-        self.assertTrue(kwargs["is_auth_required"])
-
-    async def test_get_positions_defaults_to_configured_channel(self):
-        positions_payload = {"positions": [{"channelID": "configured"}]}
-        self.exchange._api_get = AsyncMock(return_value=positions_payload)
-        self.exchange._channel_id = "configured"
-
-        result = await self.exchange.get_positions()
-
-        self.assertEqual(positions_payload["positions"], result)
-        kwargs = self.exchange._api_get.call_args.kwargs
-        self.assertEqual({"channel_id": "configured"}, kwargs["params"])
-
-    async def test_get_positions_raises_when_channel_missing(self):
-        with self.assertRaises(ValueError):
-            await self.exchange.get_positions()
 
     def test_initialize_trading_pair_symbols_from_exchange_info_builds_bidict(self):
         payload = {
@@ -228,7 +194,7 @@ class YellowProExchangeAdvancedTests(IsolatedAsyncioWrapperTestCase):
         self.assertIsNotNone(tracked_order)
         self.assertEqual(OrderState.CANCELED, tracked_order.current_state)
 
-    async def test_place_order_includes_channel_and_leverage(self):
+    async def test_place_order_builds_correct_payload(self):
         post_mock = AsyncMock(return_value={"order_uuid": "uuid-abc"})
         self.exchange._api_post = post_mock
 
@@ -239,15 +205,14 @@ class YellowProExchangeAdvancedTests(IsolatedAsyncioWrapperTestCase):
             trade_type=TradeType.BUY,
             order_type=OrderType.LIMIT,
             price=Decimal("101.5"),
-            channel_id="custom-channel",
-            leverage="5",
         )
 
         payload = post_mock.await_args.kwargs["data"]
-        self.assertEqual("custom-channel", payload["channelID"])
-        self.assertEqual("5", payload["leverage"])
         self.assertEqual("limit", payload["type"])
         self.assertEqual("COINALPHAHBOT", payload["market"])
+        self.assertEqual("buy", payload["side"])
+        self.assertNotIn("channelID", payload)
+        self.assertNotIn("leverage", payload)
 
     async def test_user_stream_event_listener_routes_private_channels(self):
         order_event = {

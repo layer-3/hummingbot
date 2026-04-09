@@ -2,7 +2,7 @@ import hashlib
 import hmac
 import json
 import time
-from typing import Optional
+from typing import Dict
 from urllib.parse import parse_qsl, urlparse
 
 from hummingbot.connector.exchange.yellow_pro import yellow_pro_constants as CONSTANTS
@@ -45,7 +45,15 @@ class YellowProAuth(AuthBase):
         canonical_field_string = ""
         if params:
             sorted_keys = sorted(params.keys())
-            canonical_field_string = "|".join(f"{k}={params[k]}" for k in sorted_keys)
+            parts = []
+            for k in sorted_keys:
+                v = params[k]
+                if isinstance(v, bool):
+                    str_val = "true" if v else "false"
+                else:
+                    str_val = str(v) if v is not None else ""
+                parts.append(f"{k}={str_val}")
+            canonical_field_string = "|".join(parts)
 
         prehash = f"{request.method}{path}{timestamp}{canonical_field_string}"
         signature = hmac.new(
@@ -61,19 +69,20 @@ class YellowProAuth(AuthBase):
         request.headers = headers
         return request
 
-    def _sign_ws_request(self, request: WSRequest) -> WSRequest:
-        headers = request.headers or {}
+    def get_ws_auth_headers(self) -> Dict[str, str]:
         timestamp = str(int(time.time()))
-
         prehash = f"GET/ws{timestamp}"
         signature = hmac.new(
             self._api_secret.encode("utf-8"),
             prehash.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
+        return {
+            "X-API-KEY": self._api_key,
+            "X-SIGNATURE": signature,
+            "X-TIMESTAMP": timestamp,
+        }
 
-        headers["X-API-KEY"] = self._api_key
-        headers["X-SIGNATURE"] = signature
-        headers["X-TIMESTAMP"] = timestamp
-        request.headers = headers
+    def _sign_ws_request(self, request: WSRequest) -> WSRequest:
+        request.headers = {**(request.headers or {}), **self.get_ws_auth_headers()}
         return request

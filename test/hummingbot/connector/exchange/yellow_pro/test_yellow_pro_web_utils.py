@@ -1,9 +1,10 @@
+from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest import TestCase
 
-from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
-
-from hummingbot.connector.exchange.yellow_pro import yellow_pro_constants as CONSTANTS
-from hummingbot.connector.exchange.yellow_pro import yellow_pro_web_utils as web_utils
+from hummingbot.connector.exchange.yellow_pro import (
+    yellow_pro_constants as CONSTANTS,
+    yellow_pro_web_utils as web_utils,
+)
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
 
 
@@ -11,20 +12,18 @@ class YellowProWebUtilsTests(TestCase):
 
     def test_rest_url_uses_domain_base(self):
         path = "/test"
-        domain = CONSTANTS.UAT_DOMAIN
+        domain = CONSTANTS.PRODUCTION_DOMAIN
 
         url = web_utils.rest_url(path, domain)
 
         self.assertEqual(f"{CONSTANTS.REST_URLS[domain]}{path}", url)
 
-    def test_auth_and_quote_urls_follow_domain(self):
-        path = "/auth"
+    def test_quote_url_follows_domain(self):
+        path = "/quote"
         domain = CONSTANTS.PRODUCTION_DOMAIN
 
-        auth_url = web_utils.auth_rest_url(path, domain)
         quote_url = web_utils.quote_rest_url(path, domain)
 
-        self.assertEqual(f"{CONSTANTS.AUTH_URLS[domain]}{path}", auth_url)
         self.assertEqual(f"{CONSTANTS.QUOTE_URLS[domain]}{path}", quote_url)
 
     def test_build_api_factory_includes_preprocessor(self):

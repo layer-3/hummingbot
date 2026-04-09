@@ -44,14 +44,15 @@ API_KEY = os.environ.get("YELLOW_PRO_API_KEY", "")
 API_SECRET = os.environ.get("YELLOW_PRO_API_SECRET", "")
 SESSION_ID = os.environ.get("YELLOW_PRO_SESSION_ID", "")
 CHANNEL_ID = os.environ.get("YELLOW_PRO_CHANNEL_ID", "")
-TRADING_PAIR = os.environ.get("YELLOW_PRO_TRADING_PAIR", "BTC-YTEST.USD")
+TRADING_PAIR = os.environ.get("YELLOW_PRO_TRADING_PAIR", "ETH-USDT")
+DOMAIN = os.environ.get("YELLOW_PRO_DOMAIN", CONSTANTS.DOMAIN)
 
 HAS_CREDENTIALS = bool(API_KEY and API_SECRET and SESSION_ID)
 
 # Safe distance from market price for test orders
 BUY_PRICE_FACTOR = Decimal("0.5")   # 50% below best bid
 SELL_PRICE_FACTOR = Decimal("2.0")  # 2x above best ask
-TEST_QUANTITY = Decimal("0.0001")
+TEST_QUANTITY = Decimal("0.001")
 
 # Mark every test in this file as a live test so CI can exclude them
 pytestmark = pytest.mark.livetest
@@ -74,6 +75,7 @@ def exchange() -> YellowProExchange:
         yellow_pro_api_secret=API_SECRET,
         trading_pairs=[TRADING_PAIR],
         trading_required=HAS_CREDENTIALS,
+        yellow_pro_domain=DOMAIN,
     )
 
 
@@ -129,15 +131,6 @@ class TestConnectivity:
             )
         )
         assert resp is not None, "Health check returned no response"
-
-    @requires_credentials
-    def test_auth_health(self, exchange: YellowProExchange):
-        """GET /auth/health — verifies API key is accepted."""
-        loop = _get_event_loop()
-        resp = loop.run_until_complete(
-            exchange._api_get(path_url=CONSTANTS.AUTH_HEALTH_URL, is_auth_required=True)
-        )
-        assert resp is not None
 
 
 # ---------------------------------------------------------------------------
@@ -366,28 +359,26 @@ class TestOrders:
         asks = resp.get("asks", [])
         best_bid = Decimal(str(bids[0][0])) if bids else None
         best_ask = Decimal(str(asks[0][0])) if asks else None
-        if best_bid is None or best_ask is None:
+        ref_price = best_bid or best_ask
+        if ref_price is None:
             pytest.skip("Order book is empty — cannot compute safe test prices")
-        return best_bid * BUY_PRICE_FACTOR, best_ask * SELL_PRICE_FACTOR
+        safe_buy = (best_bid or ref_price) * BUY_PRICE_FACTOR
+        safe_sell = (best_ask or ref_price) * SELL_PRICE_FACTOR
+        return safe_buy, safe_sell
 
     def _place_order(self, exchange: YellowProExchange, side: str,
                      order_type: str, price: Decimal, qty: Decimal) -> dict:
         """Place an order and return the raw response."""
-        import json
-        from hummingbot.core.web_assistant.connections.data_types import RESTMethod
-
         symbol = _exchange_symbol(exchange, TRADING_PAIR)
-        channel = (CHANNEL_ID or SESSION_ID).strip()
         body = {
             "app_session_id": SESSION_ID,
             "market": symbol,
             "type": order_type,
             "side": side,
-            "quantity": str(qty),
-            "price": str(price.quantize(Decimal("0.0001"))),
+            "amount": str(qty),
+            "price": str(price.quantize(Decimal("0.01"))),
+            "time_in_force": "gtc",
         }
-        if channel:
-            body["channel_id"] = channel
 
         loop = _get_event_loop()
         resp = loop.run_until_complete(
@@ -421,10 +412,10 @@ class TestOrders:
         assert cancelled, f"Failed to cancel order {order_id}"
 
     @requires_credentials
-    def test_place_and_cancel_limit_maker_sell(self, exchange: YellowProExchange):
-        """Place a LIMIT_MAKER sell order far above market and cancel it."""
+    def test_place_and_cancel_limit_sell(self, exchange: YellowProExchange):
+        """Place a LIMIT sell order far above market and cancel it."""
         _, safe_sell = self._get_safe_prices(exchange)
-        resp = self._place_order(exchange, "sell", "limit_maker", safe_sell, TEST_QUANTITY)
+        resp = self._place_order(exchange, "sell", "limit", safe_sell, TEST_QUANTITY)
 
         order_id = resp.get("order_uuid") or resp.get("uuid") or resp.get("order_id")
         assert order_id is not None, f"No order ID in response: {resp}"
@@ -442,30 +433,3 @@ class TestOrders:
 
         result = self._cancel_order(exchange, str(order_id))
         assert result is True
-
-
-# ---------------------------------------------------------------------------
-# 6. Positions  (requires credentials + channel)
-# ---------------------------------------------------------------------------
-
-class TestPositions:
-    @requires_credentials
-    def test_get_positions_returns_list(self, exchange: YellowProExchange):
-        """get_positions() must return a list (may be empty)."""
-        channel = (CHANNEL_ID or SESSION_ID).strip()
-        if not channel:
-            pytest.skip("No channel_id or session_id available for positions query")
-        loop = _get_event_loop()
-        positions = loop.run_until_complete(exchange.get_positions(channel_id=channel))
-        assert isinstance(positions, list)
-
-    @requires_credentials
-    def test_position_entries_have_required_fields(self, exchange: YellowProExchange):
-        """Each position entry must have a market field."""
-        channel = (CHANNEL_ID or SESSION_ID).strip()
-        if not channel:
-            pytest.skip("No channel_id or session_id available")
-        loop = _get_event_loop()
-        positions = loop.run_until_complete(exchange.get_positions(channel_id=channel))
-        for pos in positions:
-            assert "market" in pos or "symbol" in pos, f"Position missing market field: {pos}"

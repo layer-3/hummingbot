@@ -1,6 +1,5 @@
 import asyncio
 import json
-import time
 from collections import deque
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from typing import Any, AsyncIterable, Awaitable, Deque, Dict, Iterable, List, Optional, Set, Tuple
@@ -8,23 +7,28 @@ from typing import Any, AsyncIterable, Awaitable, Deque, Dict, Iterable, List, O
 from bidict import bidict
 
 from hummingbot.connector.constants import s_decimal_0, s_decimal_NaN
-from hummingbot.connector.exchange.yellow_pro import yellow_pro_constants as CONSTANTS, yellow_pro_web_utils as web_utils
-from hummingbot.connector.exchange.yellow_pro.yellow_pro_api_order_book_data_source import YellowProAPIOrderBookDataSource
-from hummingbot.connector.exchange.yellow_pro.yellow_pro_api_user_stream_data_source import YellowProAPIUserStreamDataSource
+from hummingbot.connector.exchange.yellow_pro import (
+    yellow_pro_constants as CONSTANTS,
+    yellow_pro_web_utils as web_utils,
+)
+from hummingbot.connector.exchange.yellow_pro.yellow_pro_api_order_book_data_source import (
+    YellowProAPIOrderBookDataSource,
+)
+from hummingbot.connector.exchange.yellow_pro.yellow_pro_api_user_stream_data_source import (
+    YellowProAPIUserStreamDataSource,
+)
 from hummingbot.connector.exchange.yellow_pro.yellow_pro_auth import YellowProAuth
 from hummingbot.connector.exchange.yellow_pro.yellow_pro_order_book import YellowProOrderBook
-from hummingbot.connector.exchange.yellow_pro.yellow_pro_perf_tracer import PerfTracer
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.api_throttler.data_types import RateLimit
-from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
@@ -40,32 +44,21 @@ class YellowProExchange(ExchangePyBase):
     MAX_TRADE_HISTORY_PAGES = 5
     MAX_ORDER_HISTORY_PAGES = 5
     MAX_OPEN_ORDERS_PAGES = 1
-    OPEN_ORDERS_RECONCILIATION_INTERVAL = 5.0
 
     def __init__(
             self,
             yellow_pro_app_session_id: str,
             yellow_pro_api_key: str = "",
             yellow_pro_api_secret: str = "",
-            yellow_pro_channel_id: Optional[str] = None,
-            yellow_pro_leverage: Optional[Decimal] = Decimal("1"),
             balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
             rate_limits_share_pct: Decimal = Decimal("100"),
             trading_pairs: Optional[List[str]] = None,
             trading_required: bool = True,
-            yellow_pro_domain: str = CONSTANTS.DOMAIN,
-            open_orders_reconciliation_interval: float = OPEN_ORDERS_RECONCILIATION_INTERVAL):
+            yellow_pro_domain: str = CONSTANTS.DOMAIN):
         self._domain = yellow_pro_domain if yellow_pro_domain in CONSTANTS.REST_URLS else CONSTANTS.DOMAIN
         self._app_session_id = yellow_pro_app_session_id
         if not self._app_session_id:
             raise ValueError("YellowPro app session id is required.")
-        channel_id = (yellow_pro_channel_id or "").strip()
-        self._channel_id = channel_id or None
-        leverage_value = yellow_pro_leverage
-        if leverage_value is not None:
-            self._default_leverage = self._decimal_to_str(leverage_value)
-        else:
-            self._default_leverage = None
         self._trading_pairs = list(trading_pairs) if trading_pairs is not None else []
         self._trading_required = trading_required
         self._auth_instance = YellowProAuth(
@@ -84,16 +77,6 @@ class YellowProExchange(ExchangePyBase):
         self._symbol_map_refresh_task: Optional[asyncio.Task] = None
         self._trading_rules_refresh_task: Optional[asyncio.Task] = None
         self._balance_refresh_task: Optional[asyncio.Task] = None
-        self._open_orders_reconciliation_task: Optional[asyncio.Task] = None
-        # Track cancel attempts for untracked orders to avoid infinite retry
-        self._cancel_attempts_map: Dict[str, int] = {}
-        try:
-            interval = float(open_orders_reconciliation_interval)
-            self._open_orders_reconciliation_interval = interval if interval > 0 else self.OPEN_ORDERS_RECONCILIATION_INTERVAL
-        except Exception:
-            self._open_orders_reconciliation_interval = self.OPEN_ORDERS_RECONCILIATION_INTERVAL
-        self._startup_timestamp = time.time()
-        self._perf_tracer = PerfTracer()
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @property
@@ -147,13 +130,6 @@ class YellowProExchange(ExchangePyBase):
     @property
     def status_dict(self) -> Dict[str, bool]:
         status = super().status_dict
-        # Add open orders reconciliation as a ready condition
-        if self.is_trading_required:
-            reconciliation_ready = (
-                self._open_orders_reconciliation_task is not None
-                and not self._open_orders_reconciliation_task.done()
-            )
-            status["open_orders_reconciliation_initialized"] = reconciliation_ready
         if status == self._last_ready_status:
             return status
         for key, value in status.items():
@@ -194,22 +170,14 @@ class YellowProExchange(ExchangePyBase):
                 self._user_stream_event_listener_task = safe_ensure_future(self._user_stream_event_listener())
                 self._user_stream_event_listener_task.add_done_callback(
                     lambda _: setattr(self, "_user_stream_event_listener_task", None))
-        if "open_orders_reconciliation_initialized" in pending_keys and self.is_trading_required:
-            self._start_open_orders_reconciliation()
         if not self._poll_notifier.is_set():
             self._poll_notifier.set()
-
-    async def _make_network_check_request(self):
-        await self._api_get(path_url=self.check_network_request_path, is_auth_required=True)
 
     async def start_network(self):
         await super().start_network()
 
     async def stop_network(self):
-        await self._stop_open_orders_reconciliation()
-        await self._cancel_all_open_orders()
         await super().stop_network()
-        await self._perf_tracer.stop()
 
     def supported_order_types(self) -> List[OrderType]:
         return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
@@ -233,6 +201,7 @@ class YellowProExchange(ExchangePyBase):
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
         return YellowProAPIUserStreamDataSource(
             auth=self._auth_instance,
+            app_session_id=self._app_session_id,
             trading_pairs=self._trading_pairs,
             connector=self,
             api_factory=self._web_assistants_factory,
@@ -376,29 +345,6 @@ class YellowProExchange(ExchangePyBase):
                     self.logger().debug(f"Unexpected ticker payload for {trading_pair}: {response}")
         return results
 
-    async def get_positions(self, channel_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        Retrieve open positions for the provided (or configured) channel.
-        """
-        effective_channel_id = (channel_id or self._channel_id or "").strip()
-        if not effective_channel_id:
-            raise ValueError("YellowPro channel id is required to fetch positions.")
-        params = {"channel_id": effective_channel_id}
-        response = await self._api_get(
-            path_url=CONSTANTS.POSITIONS_URL,
-            params=params,
-            is_auth_required=True,
-            limit_id=CONSTANTS.POSITIONS_URL)
-        if isinstance(response, list):
-            return response
-        if isinstance(response, dict):
-            positions_payload = response.get("positions")
-            if isinstance(positions_payload, list):
-                return positions_payload
-        if response:
-            self.logger().debug("Unexpected YellowPro positions payload: %s", response)
-        return []
-
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
         return CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(status_update_exception)
 
@@ -488,20 +434,16 @@ class YellowProExchange(ExchangePyBase):
             normalized = self._normalize_bool(payload.get(key))
             if normalized is not None:
                 return normalized
-        maker_id = payload.get("maker_id")
-        channel_reference = (self._channel_id or self._app_session_id or "").strip()
-        if maker_id is not None and channel_reference:
-            return str(maker_id).strip().lower() == channel_reference.lower()
         return False
 
     def _orders_cache_key(self, market: str) -> str:
-        channel_reference = (self._channel_id or self._app_session_id or "").strip().lower()
-        return f"{market.upper()}:{channel_reference}"
+        return f"{market.upper()}:{self._app_session_id}"
 
     @staticmethod
     def _find_order_in_snapshot(orders: Iterable[Dict[str, Any]], exchange_order_id: str) -> Optional[Dict[str, Any]]:
         for order in orders:
-            if str(order.get("order_id")) == exchange_order_id:
+            oid = order.get("order_uuid") or order.get("order_id")
+            if oid is not None and str(oid) == exchange_order_id:
                 return order
         return None
 
@@ -546,9 +488,6 @@ class YellowProExchange(ExchangePyBase):
             "market": market,
             "page_size": page_size,
         }
-        channel_id = self._channel_id or self._app_session_id
-        if channel_id:
-            params["channel_id"] = channel_id
         aggregated: List[Dict[str, Any]] = []
         for page in range(1, self.MAX_ORDER_HISTORY_PAGES + 1):
             params["page"] = page
@@ -586,9 +525,6 @@ class YellowProExchange(ExchangePyBase):
             params["market"] = normalized_market
         else:
             normalized_market = "ALL"
-        channel_id = (self._channel_id or self._app_session_id or "").strip()
-        if channel_id:
-            params["channel_id"] = channel_id
         aggregated: List[Dict[str, Any]] = []
         for page in range(1, self.MAX_OPEN_ORDERS_PAGES + 1):
             params["page"] = page
@@ -639,17 +575,9 @@ class YellowProExchange(ExchangePyBase):
                 break
         return aggregated
 
-    async def _cancel_order_by_uuid(self, market: str, order_uuid: str, client_order_id: Optional[str] = None) -> bool:
+    async def _cancel_order_by_uuid(self, market: str, order_uuid: str) -> bool:
         if order_uuid is None:
             return False
-
-        # Record cancel request time
-        if client_order_id:
-            safe_ensure_future(self._perf_tracer.record_event(
-                order_id=client_order_id,
-                event_type="cancel_request_time",
-                timestamp=time.time()
-            ))
 
         normalized_market = str(market).upper()
         # Look up tracked order to get order type for cancel payload
@@ -664,13 +592,13 @@ class YellowProExchange(ExchangePyBase):
             order_type_str = "market"
         payload = {
             "app_session_id": self._app_session_id,
-            "channelID": self._app_session_id,
             "market": normalized_market,
             "order_uuid": order_uuid,
             "type": order_type_str,
         }
         response = await self._api_delete(
             path_url=CONSTANTS.CANCEL_ORDER_URL,
+            params=payload,
             data=payload,
             is_auth_required=True,
             limit_id=CONSTANTS.CANCEL_ORDER_URL,
@@ -682,214 +610,7 @@ class YellowProExchange(ExchangePyBase):
         )
         if not isinstance(validated_response.get("message"), str):
             self.logger().debug("YellowPro cancel response missing message field: %s", validated_response)
-
-        # Record cancel ack
-        if client_order_id:
-            safe_ensure_future(self._perf_tracer.record_event(
-                order_id=client_order_id,
-                event_type="cancel_ack_time",
-                timestamp=time.time()
-            ))
         return True
-
-    async def _cancel_open_orders_for_market(self, market: str) -> int:
-        open_orders = await self._fetch_open_orders_for_market(market)
-        canceled = 0
-        for order in open_orders:
-            order_uuid = order.get("order_uuid") or order.get("uuid") or order.get("order_id")
-            if order_uuid is None:
-                continue
-            try:
-                if await self._cancel_order_by_uuid(market, str(order_uuid)):
-                    canceled += 1
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self.logger().warning(
-                    "Failed to cancel YellowPro open order %s on market %s.",
-                    order_uuid,
-                    market,
-                    exc_info=True,
-                )
-        if canceled > 0:
-            self.logger().info("YellowPro canceled %s open orders on market %s.", canceled, market)
-        else:
-            self.logger().debug("YellowPro open order cleanup found no orders to cancel on market %s.", market)
-        return canceled
-
-    async def _cancel_all_open_orders(self):
-        if not self.is_trading_required:
-            return
-
-        open_orders = await self._fetch_open_orders_for_market()
-        if not open_orders:
-            self.logger().debug("YellowPro open order cleanup found no orders to cancel.")
-            return
-
-        total_canceled = 0
-        for order in open_orders:
-            order_uuid = order.get("order_uuid") or order.get("uuid") or order.get("order_id")
-            if order_uuid is None:
-                continue
-
-            market = order.get("market")
-            if market is None:
-                self.logger().warning(
-                    "YellowPro cannot cancel order %s: market field missing.",
-                    order_uuid
-                )
-                continue
-
-            try:
-                if await self._cancel_order_by_uuid(market, str(order_uuid)):
-                    total_canceled += 1
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self.logger().warning(
-                    "Failed to cancel YellowPro open order %s on market %s.",
-                    order_uuid,
-                    market,
-                    exc_info=True,
-                )
-
-        if total_canceled > 0:
-            self.logger().info(
-                "YellowPro open order cleanup canceled %s orders.",
-                total_canceled,
-            )
-        else:
-            self.logger().debug("YellowPro open order cleanup found no orders to cancel.")
-
-    def _start_open_orders_reconciliation(self):
-        if self._open_orders_reconciliation_task is None or self._open_orders_reconciliation_task.done():
-            self._open_orders_reconciliation_task = safe_ensure_future(self._open_orders_reconciliation_loop())
-            self._open_orders_reconciliation_task.add_done_callback(
-                lambda _: setattr(self, "_open_orders_reconciliation_task", None))
-        self._perf_tracer.start()
-
-    async def _stop_open_orders_reconciliation(self):
-        await self._reconcile_open_orders()
-
-        task = self._open_orders_reconciliation_task
-        if task is not None:
-            task.cancel()
-            self._open_orders_reconciliation_task = None
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                self.logger().debug("YellowPro open orders reconciliation task stopped with error.", exc_info=True)
-
-    async def _open_orders_reconciliation_loop(self):
-        while True:
-            try:
-                await self._reconcile_open_orders()
-                await self._sleep(self._open_orders_reconciliation_interval)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self.logger().exception("YellowPro open orders reconciliation loop failed.")
-                await self._sleep(1.0)
-
-    async def _reconcile_open_orders(self):
-        if not self.is_trading_required:
-            return
-
-        # Fetch all open orders across all markets in one call
-        open_orders = await self._fetch_open_orders_for_market()
-
-        # Statistics
-        fetched_count = len(open_orders)
-        found_in_active = 0
-        not_found_in_active = 0
-        filtered_by_time = 0
-
-        for open_order in open_orders:
-            exchange_order_id = (
-                open_order.get("order_uuid")
-                or open_order.get("uuid")
-                or open_order.get("order_id")
-            )
-            if exchange_order_id is None:
-                continue
-            exchange_order_id = str(exchange_order_id)
-
-            # Filter by created_at: only process orders created after startup
-            created_at = open_order.get("created_at")
-            if created_at:
-                created_timestamp = self._parse_iso_timestamp(created_at)
-                if created_timestamp > 0 and created_timestamp < self._startup_timestamp:
-                    # Order was created before this session started, skip it
-                    filtered_by_time += 1
-                    continue
-
-            # Check if this order is tracked in active orders
-            if any(
-                order.exchange_order_id == exchange_order_id
-                for order in self._order_tracker.active_orders.values()
-                if order.exchange_order_id
-            ):
-                found_in_active += 1
-                continue
-
-            # Order not tracked - cancel it
-            not_found_in_active += 1
-            market = open_order.get("market")
-            if market is None:
-                self.logger().warning(
-                    "YellowPro cannot cancel untracked open order %s: market field missing.",
-                    exchange_order_id
-                )
-                continue
-
-            # Check cancel attempts, skip if exceeded max retries
-            cancel_attempts = self._cancel_attempts_map.get(exchange_order_id, 0)
-            if cancel_attempts >= 3:
-                self.logger().debug(
-                    "YellowPro skipping cancel for order %s on market %s: already attempted %s times.",
-                    exchange_order_id,
-                    market,
-                    cancel_attempts
-                )
-                not_found_in_active -= 1
-                continue
-
-            # Increment cancel attempt counter
-            self._cancel_attempts_map[exchange_order_id] = cancel_attempts + 1
-
-            try:
-                await self._cancel_order_by_uuid(market, exchange_order_id)
-                self.logger().warning(
-                    "YellowPro canceled untracked open order %s on market %s (attempt %s).",
-                    exchange_order_id,
-                    market,
-                    self._cancel_attempts_map[exchange_order_id]
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self.logger().warning(
-                    "YellowPro failed to cancel untracked open order %s on market %s (attempt %s).",
-                    exchange_order_id,
-                    market,
-                    self._cancel_attempts_map[exchange_order_id],
-                    exc_info=True,
-                )
-
-        # Log statistics
-        self.logger().info(
-            "YellowPro order reconciliation - "
-            "Fetched from exchange: %s orders, "
-            "Filtered by created_at (before startup): %s, "
-            "Found in active orders: %s, "
-            "Not found in active (canceled): %s",
-            fetched_count,
-            filtered_by_time,
-            found_in_active,
-            not_found_in_active
-        )
 
     async def _download_trades_snapshot(
             self,
@@ -905,9 +626,6 @@ class YellowProExchange(ExchangePyBase):
             "app_session_id": self._app_session_id,
             "page_size": page_size,
         }
-        channel_id = self._channel_id or self._app_session_id
-        if channel_id:
-            params["channel_id"] = channel_id
         aggregated: List[Dict[str, Any]] = []
         for page in range(1, self.MAX_TRADE_HISTORY_PAGES + 1):
             params["page"] = page
@@ -981,20 +699,6 @@ class YellowProExchange(ExchangePyBase):
             "side": order_side,
             "amount": self._decimal_to_str(amount),
         }
-        channel_override = kwargs.get("channel_id")
-        channel_id = (str(channel_override).strip()
-                      if channel_override is not None
-                      else (self._channel_id or self._app_session_id))
-        if channel_id:
-            order_payload["channelID"] = channel_id
-        leverage_override = kwargs.get("leverage")
-        leverage_value: Optional[str]
-        if leverage_override is not None:
-            leverage_value = str(leverage_override)
-        else:
-            leverage_value = self._default_leverage
-        if leverage_value:
-            order_payload["leverage"] = leverage_value
         if order_type is OrderType.MARKET:
             order_payload["type"] = "market"
             order_payload["time_in_force"] = "ioc"
@@ -1007,39 +711,15 @@ class YellowProExchange(ExchangePyBase):
                 "price": self._decimal_to_str(price),
                 "time_in_force": tif,
             })
-        # Capture request time
-        request_time = time.time()
-
-        # Use execute_request_and_get_response to access headers
-        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
-        url = await self._api_request_url(path_url=CONSTANTS.CREATE_ORDER_URL, is_auth_required=True)
-
-        response = await rest_assistant.execute_request_and_get_response(
-            url=url,
+        response_json = await self._api_post(
+            path_url=CONSTANTS.CREATE_ORDER_URL,
             data=order_payload,
-            method=RESTMethod.POST,
             is_auth_required=True,
-            throttler_limit_id=CONSTANTS.CREATE_ORDER_URL,
+            limit_id=CONSTANTS.CREATE_ORDER_URL,
         )
-        # Extract X-Trace-Id and record request with trace_id
-        headers = response.headers
-        trace_id = headers.get("X-Trace-Id")
-        safe_ensure_future(self._perf_tracer.record_event(
-            order_id=order_id,
-            event_type="request_time",
-            timestamp=request_time,
-            trace_id=trace_id
-        ))
 
-        response_json = await response.json()
-
-        # Check if response contains order_uuid before validation (from HEAD)
-        if not isinstance(response_json, dict) or not response_json.get("order_uuid"):
-            self.logger().error(
-                "YellowPro order request for %s failed: missing order_uuid in response. Payload: %s",
-                order_id,
-                response_json,
-            )
+        if not isinstance(response_json, dict):
+            raise IOError(f"YellowPro order placement unexpected response: {response_json}")
 
         self.logger().info(
             "YellowPro order request for %s responded with payload: %s",
@@ -1050,52 +730,12 @@ class YellowProExchange(ExchangePyBase):
         validated_response = self._validate_yellow_pro_response(
             payload=response_json,
             operation="order placement",
-            required_fields=("order_uuid",),
         )
-        exchange_order_id = str(validated_response["order_uuid"])
-
-        # Record order_uuid and ack_time
-        safe_ensure_future(self._perf_tracer.record_event(
-            order_id=order_id,
-            event_type="ack_time",
-            timestamp=time.time(),
-            order_uuid=exchange_order_id
-        ))
-
+        exchange_order_id = validated_response.get("order_uuid") or validated_response.get("order_id")
+        if not exchange_order_id:
+            raise IOError(f"YellowPro order placement missing order_uuid/order_id: {validated_response}")
+        exchange_order_id = str(exchange_order_id)
         return exchange_order_id, self.current_timestamp
-
-    async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
-        exchange_order_id, update_timestamp = await self._place_order(
-            order_id=order.client_order_id,
-            trading_pair=order.trading_pair,
-            amount=order.amount,
-            trade_type=order.trade_type,
-            order_type=order.order_type,
-            price=order.price,
-            **kwargs,
-        )
-
-        exchange_order_id_str = str(exchange_order_id)
-        if order.exchange_order_id is None:
-            order.update_exchange_order_id(exchange_order_id_str)
-        elif order.exchange_order_id != exchange_order_id_str:
-            self.logger().warning(
-                "Exchange order id mismatch for %s: tracked=%s, received=%s",
-                order.client_order_id,
-                order.exchange_order_id,
-                exchange_order_id_str,
-            )
-
-        order_update: OrderUpdate = OrderUpdate(
-            client_order_id=order.client_order_id,
-            exchange_order_id=exchange_order_id_str,
-            trading_pair=order.trading_pair,
-            update_timestamp=update_timestamp,
-            new_state=OrderState.OPEN,
-        )
-        self._order_tracker.process_order_update(order_update)
-
-        return exchange_order_id
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
@@ -1103,7 +743,7 @@ class YellowProExchange(ExchangePyBase):
         exchange_order_id = self._exchange_order_id_for_cancel(tracked_order)
         if exchange_order_id is None:
             raise IOError(f"Unable to cancel order {tracked_order.client_order_id}: exchange order id unavailable.")
-        return await self._cancel_order_by_uuid(normalized_market, exchange_order_id, tracked_order.client_order_id)
+        return await self._cancel_order_by_uuid(normalized_market, exchange_order_id)
 
     def _exchange_order_id_for_cancel(self, tracked_order: InFlightOrder) -> Optional[str]:
         exchange_order_id = tracked_order.exchange_order_id
@@ -1257,14 +897,6 @@ class YellowProExchange(ExchangePyBase):
             )
             self._order_tracker.process_trade_update(trade_update)
 
-            # Record first trade time
-            safe_ensure_future(self._perf_tracer.record_event(
-                order_id=tracked_order.client_order_id,
-                event_type="first_trade_time",
-                timestamp=time.time(),
-                overwrite=False
-            ))
-
     async def _update_trade_history(self):
         trades = await self._download_trades_snapshot(force_refresh=True)
         for trade in trades:
@@ -1382,55 +1014,3 @@ class YellowProExchange(ExchangePyBase):
             return datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00")).timestamp()
         except Exception:
             return 0
-
-    def get_price_by_type(self, trading_pair: str, price_type: PriceType) -> Decimal:
-        """
-        Gets price by type for YellowPro exchange. For test trading pairs like BTC-YTEST.USD,
-        converts YTEST.USD to USDT and queries the real market price.
-
-        :param trading_pair: The market trading pair
-        :param price_type: The price type
-        :returns The price
-        """
-        # Convert YTEST.USD pairs to USDT pairs for real price queries
-        if "YTEST.USD" in trading_pair:
-            # Convert BTC-YTEST.USD to BTC-USDT for price querying
-            usdt_trading_pair = trading_pair.replace("YTEST.USD", "USDT")
-            self.logger().debug(f"Converting {trading_pair} to {usdt_trading_pair} for price query")
-
-            try:
-                # First try to get price from order book with USDT pair
-                return super().get_price_by_type(usdt_trading_pair, price_type)
-            except Exception as e:
-                self.logger().debug(f"Order book price not available for {usdt_trading_pair}: {e}")
-
-                # Fallback to rate oracle with USDT pair
-                from hummingbot.core.rate_oracle.rate_oracle import RateOracle
-                rate_oracle = RateOracle.get_instance()
-                rate = rate_oracle.get_pair_rate(usdt_trading_pair)
-                if rate is not None:
-                    self.logger().debug(f"Using rate oracle price for {usdt_trading_pair}: {rate}")
-                    return rate
-
-                # If still no rate found, use a reasonable fallback
-                self.logger().warning(f"No rate found for {usdt_trading_pair}, using fallback price.")
-                # For BTC-USDT, use a reasonable market price as fallback
-                if "BTC" in trading_pair:
-                    return Decimal("100000")  # 100K USDT per BTC
-                else:
-                    return Decimal("1")  # Default fallback
-
-        # For non-test pairs, try to get the price from the order book
-        try:
-            return super().get_price_by_type(trading_pair, price_type)
-        except Exception as e:
-            self.logger().warning(f"Could not get price for {trading_pair}: {e}. Falling back to rate oracle.")
-            # Fallback to rate oracle if order book is not available
-            from hummingbot.core.rate_oracle.rate_oracle import RateOracle
-            rate_oracle = RateOracle.get_instance()
-            rate = rate_oracle.get_pair_rate(trading_pair)
-            if rate is not None:
-                return rate
-            # If still no rate found, return 1 as a last resort
-            self.logger().warning(f"No rate found for {trading_pair}, using fallback price of 1.")
-            return Decimal("1")

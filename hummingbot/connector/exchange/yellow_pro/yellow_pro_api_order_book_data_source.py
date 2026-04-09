@@ -2,7 +2,10 @@ import asyncio
 import itertools
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from hummingbot.connector.exchange.yellow_pro import yellow_pro_constants as CONSTANTS, yellow_pro_web_utils as web_utils
+from hummingbot.connector.exchange.yellow_pro import (
+    yellow_pro_constants as CONSTANTS,
+    yellow_pro_web_utils as web_utils,
+)
 from hummingbot.connector.exchange.yellow_pro.yellow_pro_order_book import YellowProOrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
@@ -100,14 +103,15 @@ class YellowProAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
             for trading_pair in self._trading_pairs:
                 exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair)
-                payload = {
-                    "id": next(self._subscription_id_iterator),
-                    "subscribe": {
-                        "channel": f"public.orderbook.increment.{exchange_symbol}",
-                    },
-                }
-                subscribe_request = WSJSONRequest(payload=payload)
-                await ws.send(subscribe_request)
+                for channel in (
+                    f"public.orderbook.increment.{exchange_symbol}",
+                    f"public.trades.increment.{exchange_symbol}",
+                ):
+                    payload = {
+                        "id": next(self._subscription_id_iterator),
+                        "subscribe": {"channel": channel},
+                    }
+                    await ws.send(WSJSONRequest(payload=payload))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -167,6 +171,55 @@ class YellowProAPIOrderBookDataSource(OrderBookTrackerDataSource):
         trade_msg = YellowProOrderBook.trade_message_from_exchange(trade_payload)
         message_queue.put_nowait(trade_msg)
 
+    async def _process_message_for_unknown_channel(
+            self, event_message: Dict[str, Any], websocket_assistant: WSAssistant):
+        # Centrifugo server ping: empty dict → reply with empty dict
+        if isinstance(event_message, dict) and len(event_message) == 0:
+            await websocket_assistant.send(WSJSONRequest(payload={}))
+
+    async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:
+        if self._ws_assistant is None:
+            return False
+        try:
+            exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair)
+            for channel in (
+                f"public.orderbook.increment.{exchange_symbol}",
+                f"public.trades.increment.{exchange_symbol}",
+            ):
+                payload = {
+                    "id": next(self._subscription_id_iterator),
+                    "subscribe": {"channel": channel},
+                }
+                await self._ws_assistant.send(WSJSONRequest(payload=payload))
+            self.add_trading_pair(trading_pair)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().exception(f"Error subscribing to {trading_pair}")
+            return False
+
+    async def unsubscribe_from_trading_pair(self, trading_pair: str) -> bool:
+        if self._ws_assistant is None:
+            return False
+        try:
+            exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair)
+            for channel in (
+                f"public.orderbook.increment.{exchange_symbol}",
+                f"public.trades.increment.{exchange_symbol}",
+            ):
+                payload = {
+                    "id": next(self._subscription_id_iterator),
+                    "unsubscribe": {"channel": channel},
+                }
+                await self._ws_assistant.send(WSJSONRequest(payload=payload))
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().exception(f"Error unsubscribing from {trading_pair}")
+            return False
+
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
         if not isinstance(event_message, dict):
             return ""
@@ -183,12 +236,3 @@ class YellowProAPIOrderBookDataSource(OrderBookTrackerDataSource):
             if "trades" in channel:
                 return self._trade_messages_queue_key
         return ""
-
-    async def listen_for_trades(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
-        """
-        YellowPro currently does not expose a dedicated public trades websocket channel (subscribe attempts respond with
-        code 107). Override the default behaviour to avoid keeping an idle websocket consumer.
-        """
-        self.logger().debug("YellowPro trade websocket stream not available; skipping trade listener.")
-        while True:
-            await asyncio.sleep(self.ONE_HOUR)

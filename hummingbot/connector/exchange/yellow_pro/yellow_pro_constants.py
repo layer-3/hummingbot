@@ -7,19 +7,23 @@ from hummingbot.core.data_type.in_flight_order import OrderState
 EXCHANGE_NAME = "yellow_pro"
 
 PRODUCTION_DOMAIN = "production"
+STAGING_DOMAIN = "staging"
 
 DOMAIN = PRODUCTION_DOMAIN
 
 REST_URLS = {
     PRODUCTION_DOMAIN: "https://trade.api.yellow.pro",
+    STAGING_DOMAIN: "https://api.staging.yellow.pro.neodax.app",
 }
 
 QUOTE_URLS = {
     PRODUCTION_DOMAIN: "https://trade.api.yellow.pro",
+    STAGING_DOMAIN: "https://api.staging.yellow.pro.neodax.app",
 }
 
 WS_URLS = {
     PRODUCTION_DOMAIN: "wss://trade.api.yellow.pro/ws",
+    STAGING_DOMAIN: "wss://api.staging.yellow.pro.neodax.app/ws",
 }
 
 BROKER_ID = "HBOT"
@@ -33,15 +37,12 @@ SNAPSHOT_REST_URL = "/orderbook"
 EXCHANGE_INFO_URL = "/spot/exchangeInfo"
 
 ACCOUNT_INFO_URL = "/spot/account"
-ACCOUNT_LIST_URL = "/spot/accounts"
 OPEN_ORDERS_URL = "/spot/open_orders"
 ORDERS_URL = "/spot/orders"
 TRADES_URL = "/spot/trades"
 
 CREATE_ORDER_URL = "/spot/order"
 CANCEL_ORDER_URL = "/spot/order"
-
-POSITIONS_URL = "/positions"
 
 TRADE_EVENT_TYPE = "trade"
 DIFF_EVENT_TYPE = "order_book"
@@ -64,62 +65,62 @@ UNKNOWN_ORDER_MESSAGE = "order not found"
 ORDER_NOT_EXIST_MESSAGE = "order_not_found"
 
 ALL_ENDPOINTS_LIMIT = "all"
-MAX_REQUESTS_PER_MINUTE = 1200
+MAX_REQUESTS_PER_SECOND = 50
 
 RATE_LIMITS = [
-    RateLimit(ALL_ENDPOINTS_LIMIT, limit=MAX_REQUESTS_PER_MINUTE, time_interval=60),
+    RateLimit(ALL_ENDPOINTS_LIMIT, limit=MAX_REQUESTS_PER_SECOND, time_interval=1),
     RateLimit(
         limit_id=SNAPSHOT_REST_URL,
-        limit=MAX_REQUESTS_PER_MINUTE,
-        time_interval=60,
+        limit=MAX_REQUESTS_PER_SECOND,
+        time_interval=1,
         linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)],
     ),
     RateLimit(
         limit_id=TICKER_PRICE_CHANGE_URL,
-        limit=MAX_REQUESTS_PER_MINUTE,
-        time_interval=60,
+        limit=MAX_REQUESTS_PER_SECOND,
+        time_interval=1,
         linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)],
     ),
     RateLimit(
         limit_id=EXCHANGE_INFO_URL,
-        limit=MAX_REQUESTS_PER_MINUTE,
-        time_interval=60,
+        limit=MAX_REQUESTS_PER_SECOND,
+        time_interval=1,
         linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)],
     ),
     RateLimit(
         limit_id=ACCOUNT_INFO_URL,
-        limit=MAX_REQUESTS_PER_MINUTE,
-        time_interval=60,
+        limit=MAX_REQUESTS_PER_SECOND,
+        time_interval=1,
         linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)],
     ),
     RateLimit(
         limit_id=OPEN_ORDERS_URL,
-        limit=MAX_REQUESTS_PER_MINUTE,
-        time_interval=60,
+        limit=MAX_REQUESTS_PER_SECOND,
+        time_interval=1,
+        linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)],
+    ),
+    RateLimit(
+        limit_id=ORDERS_URL,
+        limit=MAX_REQUESTS_PER_SECOND,
+        time_interval=1,
         linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)],
     ),
     RateLimit(
         limit_id=TRADES_URL,
-        limit=MAX_REQUESTS_PER_MINUTE,
-        time_interval=60,
+        limit=MAX_REQUESTS_PER_SECOND,
+        time_interval=1,
         linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)],
     ),
     RateLimit(
         limit_id=CREATE_ORDER_URL,
-        limit=MAX_REQUESTS_PER_MINUTE,
-        time_interval=60,
+        limit=MAX_REQUESTS_PER_SECOND,
+        time_interval=1,
         linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)],
     ),
     RateLimit(
         limit_id=CANCEL_ORDER_URL,
-        limit=MAX_REQUESTS_PER_MINUTE,
-        time_interval=60,
-        linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)],
-    ),
-    RateLimit(
-        limit_id=POSITIONS_URL,
-        limit=MAX_REQUESTS_PER_MINUTE,
-        time_interval=60,
+        limit=MAX_REQUESTS_PER_SECOND,
+        time_interval=1,
         linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)],
     ),
 ]

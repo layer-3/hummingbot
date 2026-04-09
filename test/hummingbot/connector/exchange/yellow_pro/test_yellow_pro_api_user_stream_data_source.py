@@ -3,7 +3,9 @@ from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCa
 from unittest.mock import AsyncMock, MagicMock
 
 from hummingbot.connector.exchange.yellow_pro import yellow_pro_constants as CONSTANTS
-from hummingbot.connector.exchange.yellow_pro.yellow_pro_api_user_stream_data_source import YellowProAPIUserStreamDataSource
+from hummingbot.connector.exchange.yellow_pro.yellow_pro_api_user_stream_data_source import (
+    YellowProAPIUserStreamDataSource,
+)
 
 
 class YellowProAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
@@ -12,7 +14,7 @@ class YellowProAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
     async def asyncSetUp(self) -> None:
         await super().asyncSetUp()
         self.auth = MagicMock()
-        self.auth.ensure_active_token = AsyncMock(return_value="token-123")
+        self.auth.get_ws_auth_headers = MagicMock(return_value={"Authorization": "Bearer token-123"})
         self.connector = MagicMock()
         self.ws_assistant = MagicMock()
         self.ws_assistant.connect = AsyncMock()
@@ -22,6 +24,7 @@ class YellowProAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
         self.data_source = YellowProAPIUserStreamDataSource(
             auth=self.auth,
+            app_session_id="test-session-id",
             trading_pairs=["COINALPHA-HBOT"],
             connector=self.connector,
             api_factory=self.api_factory,
@@ -35,16 +38,23 @@ class YellowProAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.ws_assistant.connect.assert_awaited_once()
         called_kwargs = self.ws_assistant.connect.await_args.kwargs
         self.assertEqual(
-            f"Bearer token-123",
+            "Bearer token-123",
             called_kwargs["ws_headers"]["Authorization"],
         )
 
-    async def test_subscribe_channels_sends_connect_payload_with_token(self):
+    async def test_subscribe_channels_sends_connect_payload(self):
         await self.data_source._subscribe_channels(self.ws_assistant)
 
-        self.ws_assistant.send.assert_awaited_once()
-        sent_payload = self.ws_assistant.send.await_args.args[0].payload
-        self.assertEqual("token-123", sent_payload["connect"]["token"])
+        self.assertEqual(2, self.ws_assistant.send.await_count)
+        connect_payload = self.ws_assistant.send.await_args_list[0].args[0].payload
+        self.assertIn("connect", connect_payload)
+
+    async def test_subscribe_channels_sends_subscribe_payload_with_session_channel(self):
+        await self.data_source._subscribe_channels(self.ws_assistant)
+
+        subscribe_payload = self.ws_assistant.send.await_args_list[1].args[0].payload
+        self.assertIn("subscribe", subscribe_payload)
+        self.assertIn("test-session-id", subscribe_payload["subscribe"]["channel"])
 
     def test_json_fragments_splits_multiple_objects(self):
         raw = '{"a": 1} {"b": 2}   [ {"c": 3} ]'
@@ -53,13 +63,12 @@ class YellowProAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual([{"a": 1}, {"b": 2}, [{"c": 3}]], fragments)
 
-    async def test_process_event_message_records_private_channels(self):
+    async def test_process_event_message_ignores_connect_ack(self):
         queue = asyncio.Queue()
         message = {"connect": {"subs": {"private.orders": {}, "private.balance": {}}}}
 
         await self.data_source._process_event_message(message, queue)
 
-        self.assertEqual(["private.orders", "private.balance"], self.data_source._private_channels)
         self.assertTrue(queue.empty())
 
     async def test_process_event_message_enqueues_push_payloads(self):
